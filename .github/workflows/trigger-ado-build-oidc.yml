@@ -1,39 +1,44 @@
-name: Trigger ADO Build
+# GitHub Actions workflow to trigger ADO build via OIDC
+# Receives repository_dispatch from other repos and authenticates with Azure
+
+name: Trigger ADO Build (OIDC)
 
 on:
-  workflow_call:
-    inputs:
-      ado_pipeline_id:
-        required: false
-        type: string
-        default: '13484'
-      ado_organization:
-        required: false
-        type: string
-        default: 'AzureCSI'
-      ado_project:
-        required: false
-        type: string
-        default: 'Fungible'
-    secrets:
-      AZURE_CLIENT_ID:
-        required: true
-      AZURE_TENANT_ID:
-        required: true
-      AZURE_SUBSCRIPTION_ID:
-        required: true
+  repository_dispatch:
+    types: [trigger-ado-build]
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  trigger-ado-pipeline:
+  trigger-ado-build:
+    name: Trigger ADO Build
     runs-on: ubuntu-latest
     environment: copilot
+
     steps:
+      - name: Extract Dispatch Information
+        id: pr-info
+        run: |
+          echo "pr_number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+          echo "repo_name=${{ github.event.client_payload.repo_name }}" >> $GITHUB_OUTPUT
+          echo "repo_owner=${{ github.event.client_payload.repo_owner }}" >> $GITHUB_OUTPUT
+          echo "branch_name=${{ github.event.client_payload.branch_name }}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
+          echo "pr_user=${{ github.event.client_payload.pr_user }}" >> $GITHUB_OUTPUT
+          echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+
+          echo "📋 Received Dispatch:"
+          echo "  Source: ${{ github.event.client_payload.source_repo }}"
+          echo "  Repository: ${{ github.event.client_payload.repo_name }}"
+          echo "  PR Number: ${{ github.event.client_payload.pr_number }}"
+          echo "  Branch: ${{ github.event.client_payload.branch_name }}"
+          echo "  Commit: ${{ github.event.client_payload.commit_sha }}"
+          echo "  User: ${{ github.event.client_payload.pr_user }}"
+
       - name: Azure Login via OIDC
-        uses: azure/login@v1
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -42,80 +47,121 @@ jobs:
       - name: Get Azure DevOps Access Token
         id: get-token
         run: |
-          ACCESS_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv)
+          ACCESS_TOKEN=$(az account get-access-token \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+            --query accessToken -o tsv)
           echo "::add-mask::$ACCESS_TOKEN"
           echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Obtained Azure DevOps access token"
 
-      - name: Trigger Azure DevOps Pipeline
+      - name: Cancel Previous ADO Builds
         env:
-          ADO_ORGANIZATION: ${{ inputs.ado_organization }}
-          ADO_PROJECT: ${{ inputs.ado_project }}
-          ADO_PIPELINE_ID: ${{ inputs.ado_pipeline_id }}
           ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
-          REPO_NAME: ${{ github.repository }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GIT_SHA: ${{ github.sha }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}
         run: |
-          # Try to get PR title first (works for both merge commits and squash merges)
-          PR_DATA=$(curl -s -w "\n%{http_code}" -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${REPO_NAME}/commits/${GIT_SHA}/pulls")
-          PR_HTTP_CODE=$(echo "$PR_DATA" | tail -n1)
-          PR_BODY=$(echo "$PR_DATA" | sed '$d')
+          echo "🔍 Checking for previous in-progress builds for PR #${PR_NUMBER}..."
+          BUILDS_RESPONSE=$(curl -s \
+            -H "Authorization: Bearer ${ADO_TOKEN}" \
+            "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds?definitions=13484&statusFilter=inProgress,notStarted&api-version=7.0"\)
 
-          if [ "$PR_HTTP_CODE" -ge 200 ] && [ "$PR_HTTP_CODE" -lt 300 ]; then
-            PR_TITLE=$(echo "$PR_BODY" | jq -r '.[0].title // empty')
-          else
-            PR_TITLE=""
+          if ! echo "$BUILDS_RESPONSE" | jq empty 2>/dev/null; then
+            echo "❌ Invalid JSON response from ADO API"
+            exit 1
           fi
 
-          if [ -n "$PR_TITLE" ]; then
-            COMMIT_MSG="$PR_TITLE"
+          BUILD_IDS=$(echo "$BUILDS_RESPONSE" | jq -r --arg pr "${PR_NUMBER}" \
+            '.value[] | select(.templateParameters.github_pr_number == $pr) | .id')
+
+          if [ -z "$BUILD_IDS" ]; then
+            echo "✅ No previous in-progress builds found for this PR"
           else
-            # Fallback to commit message if no PR found (e.g., direct push)
-            COMMIT_MSG=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
-              "https://api.github.com/repos/${REPO_NAME}/commits/${GIT_SHA}" | \
-              jq -r '.commit.message' | head -n 1)
-            # Fallback to a default message if extraction fails
-            if [ -z "$COMMIT_MSG" ] || [ "$COMMIT_MSG" = "null" ]; then
-              COMMIT_MSG="Build for ${GIT_SHA:0:7}"
-            fi
+            for BUILD_ID in $BUILD_IDS; do
+              echo "🚫 Canceling build $BUILD_ID..."
+              curl -s -X PATCH \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${ADO_TOKEN}" \
+                -d '{"status": "Cancelling"}' \
+                "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds/$BUILD_ID?api-version=7.0" > /dev/null
+            done
           fi
 
-          # ADO limit: 255 chars total, including build prefix "yyyyMMdd.REV · "
-          REPO_SHORT=$(echo "${REPO_NAME}" | cut -d'/' -f2)
-          RESERVED_FOR_BUILD_PREFIX=20  # "20251107.123 · " = ~15 chars + buffer
-          FIXED_PART="${REPO_SHORT} - ${GIT_SHA:0:7} - "
-          MAX_MSG_LEN=$((255 - RESERVED_FOR_BUILD_PREFIX - ${#FIXED_PART}))
+      - name: Trigger ADO Pipeline
+        id: trigger-ado
+        env:
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+        run: |
+          COMMIT_SHA="${{ steps.pr-info.outputs.commit_sha }}"
+          PR_USER="${{ steps.pr-info.outputs.pr_user }}"
+          REPO_NAME="${{ steps.pr-info.outputs.repo_name }}"
+          PR_NUMBER="${{ steps.pr-info.outputs.pr_number }}"
+          BRANCH_NAME="${{ steps.pr-info.outputs.branch_name }}"
 
-          [ ${#COMMIT_MSG} -gt $MAX_MSG_LEN ] && COMMIT_MSG="${COMMIT_MSG:0:$((MAX_MSG_LEN-3))}..."
+          RUN_NAME="${REPO_NAME} · PR #${PR_NUMBER} · ${PR_USER} · ${COMMIT_SHA:0:7}"
+          RUN_NAME_SANITIZED=$(echo "$RUN_NAME" | tr -d '#' | tr ':/' '--')
+          RUN_NAME_SHORT="${RUN_NAME_SANITIZED:0:180}"
 
-          RUN_NAME="${FIXED_PART}${COMMIT_MSG}"
-          # Replace quotes with single quotes, other forbidden chars with dashes
-          SANITIZED_RUN_NAME=$(echo "${RUN_NAME}" | sed 's/"/'"'"'/g' | sed 's/[/:<>\\|?@*]/-/g')
+          PR_MAP=$(jq -n --arg repo "$REPO_NAME" --arg branch "$BRANCH_NAME" '{($repo): $branch}')
 
-          JSON_PAYLOAD=$(jq -n --arg runName "$SANITIZED_RUN_NAME" --arg github_repo "$REPO_SHORT" --arg github_branch "$GITHUB_REF_NAME" '{templateParameters: {runName: $runName, github_repo: $github_repo, github_branch: $github_branch}}')
+          JSON_PAYLOAD=$(jq -n \
+            --arg repo "$REPO_NAME" \
+            --arg pr "$PR_NUMBER" \
+            --arg branch "$BRANCH_NAME" \
+            --arg commitSha "$COMMIT_SHA" \
+            --arg runName "$RUN_NAME_SHORT" \
+            --argjson prMap "$PR_MAP" \
+            '{
+              templateParameters: {
+                github_repo: $repo,
+                github_pr_number: $pr,
+                github_branch: $branch,
+                github_commit_sha: $commitSha,
+                runName: $runName,
+                pr_map: ($prMap | tojson)
+              }
+            }')
 
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ADO_TOKEN}" \
             -d "${JSON_PAYLOAD}" \
-            "https://dev.azure.com/${ADO_ORGANIZATION}/${ADO_PROJECT}/_apis/pipelines/${ADO_PIPELINE_ID}/runs?api-version=7.0")
+            "https://dev.azure.com/AzureCSI/Fungible/_apis/pipelines/13484/runs?api-version=7.0"\)
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
 
-          echo "HTTP Status: $HTTP_CODE"
-          echo "Response: $BODY"
-
-          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            echo "✓ Azure DevOps pipeline triggered successfully"
-          else
-            echo "✗ Failed to trigger pipeline"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "❌ Failed to trigger ADO pipeline. HTTP code: $HTTP_CODE"
+            echo "Response: $BODY"
             exit 1
           fi
+
+          RUN_ID=$(echo "$BODY" | jq -r '.id')
+          RUN_URL=$(echo "$BODY" | jq -r '._links.web.href')
+          BUILD_ID=$(echo "$RUN_URL" | grep -oE 'buildId=[0-9]+' | cut -d= -f2 || echo "$RUN_ID")
+
+          echo "ado_run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "ado_build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+          echo "ado_run_url=$RUN_URL" >> $GITHUB_OUTPUT
+          echo "✅ Triggered ADO pipeline run: $RUN_ID"
+          echo "🔗 Build URL: $RUN_URL"
+
+      - name: Create Commit Status on Source Repo
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${{ steps.pr-info.outputs.source_repo }}/statuses/${{ steps.pr-info.outputs.commit_sha }}" \
+            -d '{
+              "state": "pending",
+              "target_url": "${{ steps.trigger-ado.outputs.ado_run_url }}",
+              "description": "ADO Build ${{ steps.trigger-ado.outputs.ado_build_id }} started",
+              "context": "ADO Build"
+            }'
+          echo "✅ Created pending commit status on source repo"
 
       - name: Azure Logout
         if: always()
         run: az logout
-
