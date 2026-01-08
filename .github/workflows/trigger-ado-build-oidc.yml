@@ -134,7 +134,7 @@ jobs:
             "${ADO_PIPELINE_URL}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '\$d')
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
             echo "❌ Failed to trigger ADO pipeline. HTTP code: $HTTP_CODE"
