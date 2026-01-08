@@ -60,12 +60,15 @@ jobs:
           PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}
         run: |
           echo "🔍 Checking for previous in-progress builds for PR #${PR_NUMBER}..."
-          BUILDS_RESPONSE=$(curl -s \
-            -H "Authorization: Bearer ${ADO_TOKEN}" \
-            "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds?definitions=13484&statusFilter=inProgress,notStarted&api-version=7.0"\)
+          
+          ADO_URL="https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds"
+          QUERY="definitions=13484&statusFilter=inProgress,notStarted&api-version=7.0"
+          
+          BUILDS_RESPONSE=$(curl -s -H "Authorization: Bearer ${ADO_TOKEN}" "${ADO_URL}?${QUERY}")
 
           if ! echo "$BUILDS_RESPONSE" | jq empty 2>/dev/null; then
             echo "❌ Invalid JSON response from ADO API"
+            echo "$BUILDS_RESPONSE"
             exit 1
           fi
 
@@ -81,7 +84,7 @@ jobs:
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
                 -d '{"status": "Cancelling"}' \
-                "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds/$BUILD_ID?api-version=7.0" > /dev/null
+                "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds/${BUILD_ID}?api-version=7.0" > /dev/null
             done
           fi
 
@@ -96,7 +99,7 @@ jobs:
           PR_NUMBER="${{ steps.pr-info.outputs.pr_number }}"
           BRANCH_NAME="${{ steps.pr-info.outputs.branch_name }}"
 
-          RUN_NAME="${REPO_NAME} · PR #${PR_NUMBER} · ${PR_USER} · ${COMMIT_SHA:0:7}"
+          RUN_NAME="${REPO_NAME} - PR ${PR_NUMBER} - ${PR_USER} - ${COMMIT_SHA:0:7}"
           RUN_NAME_SANITIZED=$(echo "$RUN_NAME" | tr -d '#' | tr ':/' '--')
           RUN_NAME_SHORT="${RUN_NAME_SANITIZED:0:180}"
 
@@ -120,11 +123,15 @@ jobs:
               }
             }')
 
+          echo "📋 Payload: $JSON_PAYLOAD"
+
+          ADO_PIPELINE_URL="https://dev.azure.com/AzureCSI/Fungible/_apis/pipelines/13484/runs?api-version=7.0"
+          
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ADO_TOKEN}" \
             -d "${JSON_PAYLOAD}" \
-            "https://dev.azure.com/AzureCSI/Fungible/_apis/pipelines/13484/runs?api-version=7.0"\)
+            "${ADO_PIPELINE_URL}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -149,17 +156,21 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
+          SOURCE_REPO: ${{ steps.pr-info.outputs.source_repo }}
+          COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
+          ADO_URL: ${{ steps.trigger-ado.outputs.ado_run_url }}
+          ADO_BUILD_ID: ${{ steps.trigger-ado.outputs.ado_build_id }}
         run: |
           curl -s -X POST \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/${{ steps.pr-info.outputs.source_repo }}/statuses/${{ steps.pr-info.outputs.commit_sha }}" \
-            -d '{
-              "state": "pending",
-              "target_url": "${{ steps.trigger-ado.outputs.ado_run_url }}",
-              "description": "ADO Build ${{ steps.trigger-ado.outputs.ado_build_id }} started",
-              "context": "ADO Build"
-            }'
+            "https://api.github.com/repos/${SOURCE_REPO}/statuses/${COMMIT_SHA}" \
+            -d "{
+              \"state\": \"pending\",
+              \"target_url\": \"${ADO_URL}\",
+              \"description\": \"ADO Build ${ADO_BUILD_ID} started\",
+              \"context\": \"ADO Build\"
+            }"
           echo "✅ Created pending commit status on source repo"
 
       - name: Azure Logout
