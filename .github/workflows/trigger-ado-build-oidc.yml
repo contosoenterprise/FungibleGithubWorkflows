@@ -1,0 +1,121 @@
+name: Trigger ADO Build
+
+on:
+  workflow_call:
+    inputs:
+      ado_pipeline_id:
+        required: false
+        type: string
+        default: '13484'
+      ado_organization:
+        required: false
+        type: string
+        default: 'AzureCSI'
+      ado_project:
+        required: false
+        type: string
+        default: 'Fungible'
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  trigger-ado-pipeline:
+    runs-on: ubuntu-latest
+    environment: copilot
+    steps:
+      - name: Azure Login via OIDC
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Azure DevOps Access Token
+        id: get-token
+        run: |
+          ACCESS_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv)
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Trigger Azure DevOps Pipeline
+        env:
+          ADO_ORGANIZATION: ${{ inputs.ado_organization }}
+          ADO_PROJECT: ${{ inputs.ado_project }}
+          ADO_PIPELINE_ID: ${{ inputs.ado_pipeline_id }}
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+          REPO_NAME: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try to get PR title first (works for both merge commits and squash merges)
+          PR_DATA=$(curl -s -w "\n%{http_code}" -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${REPO_NAME}/commits/${GIT_SHA}/pulls")
+          PR_HTTP_CODE=$(echo "$PR_DATA" | tail -n1)
+          PR_BODY=$(echo "$PR_DATA" | sed '$d')
+
+          if [ "$PR_HTTP_CODE" -ge 200 ] && [ "$PR_HTTP_CODE" -lt 300 ]; then
+            PR_TITLE=$(echo "$PR_BODY" | jq -r '.[0].title // empty')
+          else
+            PR_TITLE=""
+          fi
+
+          if [ -n "$PR_TITLE" ]; then
+            COMMIT_MSG="$PR_TITLE"
+          else
+            # Fallback to commit message if no PR found (e.g., direct push)
+            COMMIT_MSG=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${REPO_NAME}/commits/${GIT_SHA}" | \
+              jq -r '.commit.message' | head -n 1)
+            # Fallback to a default message if extraction fails
+            if [ -z "$COMMIT_MSG" ] || [ "$COMMIT_MSG" = "null" ]; then
+              COMMIT_MSG="Build for ${GIT_SHA:0:7}"
+            fi
+          fi
+
+          # ADO limit: 255 chars total, including build prefix "yyyyMMdd.REV · "
+          REPO_SHORT=$(echo "${REPO_NAME}" | cut -d'/' -f2)
+          RESERVED_FOR_BUILD_PREFIX=20  # "20251107.123 · " = ~15 chars + buffer
+          FIXED_PART="${REPO_SHORT} - ${GIT_SHA:0:7} - "
+          MAX_MSG_LEN=$((255 - RESERVED_FOR_BUILD_PREFIX - ${#FIXED_PART}))
+
+          [ ${#COMMIT_MSG} -gt $MAX_MSG_LEN ] && COMMIT_MSG="${COMMIT_MSG:0:$((MAX_MSG_LEN-3))}..."
+
+          RUN_NAME="${FIXED_PART}${COMMIT_MSG}"
+          # Replace quotes with single quotes, other forbidden chars with dashes
+          SANITIZED_RUN_NAME=$(echo "${RUN_NAME}" | sed 's/"/'"'"'/g' | sed 's/[/:<>\\|?@*]/-/g')
+
+          JSON_PAYLOAD=$(jq -n --arg runName "$SANITIZED_RUN_NAME" --arg github_repo "$REPO_SHORT" --arg github_branch "$GITHUB_REF_NAME" '{templateParameters: {runName: $runName, github_repo: $github_repo, github_branch: $github_branch}}')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ADO_TOKEN}" \
+            -d "${JSON_PAYLOAD}" \
+            "https://dev.azure.com/${ADO_ORGANIZATION}/${ADO_PROJECT}/_apis/pipelines/${ADO_PIPELINE_ID}/runs?api-version=7.0")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✓ Azure DevOps pipeline triggered successfully"
+          else
+            echo "✗ Failed to trigger pipeline"
+            exit 1
+          fi
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
+
