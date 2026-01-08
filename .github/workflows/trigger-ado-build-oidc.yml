@@ -134,7 +134,7 @@ jobs:
             "${ADO_PIPELINE_URL}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+          BODY=$(echo "$RESPONSE" | sed '\$d')
 
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
             echo "❌ Failed to trigger ADO pipeline. HTTP code: $HTTP_CODE"
@@ -152,15 +152,17 @@ jobs:
           echo "✅ Triggered ADO pipeline run: $RUN_ID"
           echo "🔗 Build URL: $RUN_URL"
 
-      - name: Create Commit Status on Source Repo
+      - name: Create Commit Status and PR Comment
         if: success()
         env:
           GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
           SOURCE_REPO: ${{ steps.pr-info.outputs.source_repo }}
           COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
+          PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}
           ADO_URL: ${{ steps.trigger-ado.outputs.ado_run_url }}
           ADO_BUILD_ID: ${{ steps.trigger-ado.outputs.ado_build_id }}
         run: |
+          # Create commit status
           curl -s -X POST \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -172,6 +174,44 @@ jobs:
               \"context\": \"ADO Build\"
             }"
           echo "✅ Created pending commit status on source repo"
+
+          # Check for existing ADO Build comment
+          COMMENTS=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments"\)
+
+          EXISTING_COMMENT_ID=$(echo "$COMMENTS" | jq -r '.[] | select(.body | contains("ADO Build") and contains("Build ID:")) | .id' | head -1)
+
+          # Build comment body
+          COMMENT_BODY="## 🚀 ADO Build Started
+
+          **Build ID:** [${ADO_BUILD_ID}](${ADO_URL})
+          **Commit:** ${COMMIT_SHA:0:7}
+          **Status:** ⏳ Queued (waiting for build agent)
+
+          _This comment will be updated when the build completes._"
+
+          # Escape for JSON
+          COMMENT_JSON=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
+
+          if [ -n "$EXISTING_COMMENT_ID" ] && [ "$EXISTING_COMMENT_ID" != "null" ]; then
+            # Update existing comment
+            curl -s -X PATCH \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
+              -d "$COMMENT_JSON"
+            echo "✅ Updated existing PR comment ${EXISTING_COMMENT_ID}"
+          else
+            # Create new comment
+            curl -s -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" \
+              -d "$COMMENT_JSON"
+            echo "✅ Created new PR comment"
+          fi
 
       - name: Azure Logout
         if: always()
