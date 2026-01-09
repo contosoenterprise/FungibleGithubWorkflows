@@ -1,0 +1,147 @@
+# GitHub Actions workflow to trigger ADO build via OIDC for push events
+# Receives repository_dispatch from other repos and authenticates with Azure
+# This is for master/main branch builds (not PRs)
+
+name: Trigger ADO Build - Push (OIDC)
+
+on:
+  repository_dispatch:
+    types: [trigger-ado-build-push]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  trigger-ado-build-push:
+    name: Trigger ADO Build (Push)
+    runs-on: ubuntu-latest
+    environment: copilot
+
+    steps:
+      - name: Extract Dispatch Information
+        id: push-info
+        run: |
+          echo "repo_name=${{ github.event.client_payload.repo_name }}" >> $GITHUB_OUTPUT
+          echo "repo_owner=${{ github.event.client_payload.repo_owner }}" >> $GITHUB_OUTPUT
+          echo "branch_name=${{ github.event.client_payload.branch_name }}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
+          echo "pusher=${{ github.event.client_payload.pusher }}" >> $GITHUB_OUTPUT
+          echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+
+          echo "Received Dispatch:"
+          echo "  Source: ${{ github.event.client_payload.source_repo }}"
+          echo "  Repository: ${{ github.event.client_payload.repo_name }}"
+          echo "  Branch: ${{ github.event.client_payload.branch_name }}"
+          echo "  Commit: ${{ github.event.client_payload.commit_sha }}"
+          echo "  Pusher: ${{ github.event.client_payload.pusher }}"
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Azure DevOps Access Token
+        id: get-token
+        run: |
+          ACCESS_TOKEN=$(az account get-access-token \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+            --query accessToken -o tsv)
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "Obtained Azure DevOps access token"
+
+      - name: Get Commit Message
+        id: commit-msg
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          COMMIT_SHA: ${{ github.event.client_payload.commit_sha }}
+        run: |
+          # Try to get PR title first (works for both merge commits and squash merges)
+          PR_DATA=$(curl -s -w "\n%{http_code}" -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/commits/${COMMIT_SHA}/pulls")
+          PR_HTTP_CODE=$(echo "$PR_DATA" | tail -n1)
+          PR_BODY=$(echo "$PR_DATA" | sed '$d')
+
+          if [ "$PR_HTTP_CODE" -ge 200 ] && [ "$PR_HTTP_CODE" -lt 300 ]; then
+            PR_TITLE=$(echo "$PR_BODY" | jq -r '.[0].title // empty')
+          else
+            PR_TITLE=""
+          fi
+
+          if [ -n "$PR_TITLE" ]; then
+            COMMIT_MSG="$PR_TITLE"
+          else
+            # Fallback to commit message if no PR found (e.g., direct push)
+            COMMIT_MSG=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+              "https://api.github.com/repos/${SOURCE_REPO}/commits/${COMMIT_SHA}" | \
+              jq -r '.commit.message' | head -n 1)
+            # Fallback to a default message if extraction fails
+            if [ -z "$COMMIT_MSG" ] || [ "$COMMIT_MSG" = "null" ]; then
+              COMMIT_MSG="Build for ${COMMIT_SHA:0:7}"
+            fi
+          fi
+
+          echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+
+      - name: Trigger ADO Pipeline
+        id: trigger-ado
+        env:
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+        run: |
+          COMMIT_SHA="${{ github.event.client_payload.commit_sha }}"
+          REPO_NAME="${{ github.event.client_payload.repo_name }}"
+          BRANCH_NAME="${{ github.event.client_payload.branch_name }}"
+          COMMIT_MSG="${{ steps.commit-msg.outputs.commit_msg }}"
+
+          # ADO limit: 255 chars total, including build prefix "yyyyMMdd.REV - "
+          RESERVED_FOR_BUILD_PREFIX=20
+          FIXED_PART="${REPO_NAME} - ${COMMIT_SHA:0:7} - "
+          MAX_MSG_LEN=$((255 - RESERVED_FOR_BUILD_PREFIX - ${#FIXED_PART}))
+
+          [ ${#COMMIT_MSG} -gt $MAX_MSG_LEN ] && COMMIT_MSG="${COMMIT_MSG:0:$((MAX_MSG_LEN-3))}..."
+
+          RUN_NAME="${FIXED_PART}${COMMIT_MSG}"
+          # Replace quotes with single quotes, other forbidden chars with dashes
+          SANITIZED_RUN_NAME=$(echo "${RUN_NAME}" | sed 's/"/'"'"'/g' | sed 's/[/:<>\\|?@*]/-/g')
+
+          JSON_PAYLOAD=$(jq -n \
+            --arg runName "$SANITIZED_RUN_NAME" \
+            --arg github_repo "$REPO_NAME" \
+            --arg github_branch "$BRANCH_NAME" \
+            '{templateParameters: {runName: $runName, github_repo: $github_repo, github_branch: $github_branch}}')
+
+          echo "Payload: $JSON_PAYLOAD"
+
+          ADO_PIPELINE_URL="https://dev.azure.com/AzureCSI/Fungible/_apis/pipelines/13484/runs?api-version=7.0"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ADO_TOKEN}" \
+            -d "${JSON_PAYLOAD}" \
+            "${ADO_PIPELINE_URL}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Azure DevOps pipeline triggered successfully"
+            RUN_ID=$(echo "$BODY" | jq -r '.id')
+            RUN_URL=$(echo "$BODY" | jq -r '._links.web.href')
+            echo "ado_run_id=$RUN_ID" >> $GITHUB_OUTPUT
+            echo "ado_run_url=$RUN_URL" >> $GITHUB_OUTPUT
+            echo "Build URL: $RUN_URL"
+          else
+            echo "Failed to trigger pipeline"
+            exit 1
+          fi
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
