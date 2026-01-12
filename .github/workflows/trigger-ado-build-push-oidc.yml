@@ -102,6 +102,9 @@ jobs:
           FIXED_PART="${REPO_NAME} - ${COMMIT_SHA:0:7} - "
           MAX_MSG_LEN=$((255 - RESERVED_FOR_BUILD_PREFIX - ${#FIXED_PART}))
 
+          # Remove trailing periods - forbidden in ADO
+          COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/\.$//')
+
           [ ${#COMMIT_MSG} -gt $MAX_MSG_LEN ] && COMMIT_MSG="${COMMIT_MSG:0:$((MAX_MSG_LEN-3))}..."
 
           RUN_NAME="${FIXED_PART}${COMMIT_MSG}"
