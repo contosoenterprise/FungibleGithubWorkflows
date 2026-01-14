@@ -1,0 +1,119 @@
+# GitHub Actions workflow to cancel ADO builds via OIDC
+# Receives repository_dispatch when a PR is closed without merging
+
+name: Cancel ADO Build (OIDC)
+
+on:
+  repository_dispatch:
+    types: [cancel-ado-build]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  cancel-ado-build:
+    name: Cancel ADO Build
+    runs-on: ubuntu-latest
+    environment: copilot
+
+    steps:
+      - name: Extract Dispatch Information
+        id: pr-info
+        run: |
+          echo "pr_number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+          echo "repo_name=${{ github.event.client_payload.repo_name }}" >> $GITHUB_OUTPUT
+          echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
+
+          echo "📋 Received Cancel Request:"
+          echo "  Source: ${{ github.event.client_payload.source_repo }}"
+          echo "  Repository: ${{ github.event.client_payload.repo_name }}"
+          echo "  PR Number: ${{ github.event.client_payload.pr_number }}"
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Azure DevOps Access Token
+        id: get-token
+        run: |
+          ACCESS_TOKEN=$(az account get-access-token \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+            --query accessToken -o tsv)
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Obtained Azure DevOps access token"
+
+      - name: Cancel ADO Builds for PR
+        env:
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+          PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}
+          REPO_NAME: ${{ steps.pr-info.outputs.repo_name }}
+        run: |
+          echo "🔍 Looking for in-progress builds for ${REPO_NAME} PR #${PR_NUMBER}..."
+          
+          ADO_URL="https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds"
+          QUERY="definitions=13484&statusFilter=inProgress,notStarted&api-version=7.0"
+          
+          BUILDS_RESPONSE=$(curl -s -H "Authorization: Bearer ${ADO_TOKEN}" "${ADO_URL}?${QUERY}")
+
+          if ! echo "$BUILDS_RESPONSE" | jq empty 2>/dev/null; then
+            echo "❌ Invalid JSON response from ADO API"
+            echo "$BUILDS_RESPONSE"
+            exit 1
+          fi
+
+          # Filter by both PR number AND repo name
+          BUILD_IDS=$(echo "$BUILDS_RESPONSE" | jq -r \
+            --arg pr "${PR_NUMBER}" \
+            --arg repo "${REPO_NAME}" \
+            '.value[] | select(.templateParameters.github_pr_number == $pr and .templateParameters.github_repo == $repo) | .id')
+
+          if [ -z "$BUILD_IDS" ]; then
+            echo "✅ No in-progress builds found for ${REPO_NAME} PR #${PR_NUMBER}"
+          else
+            CANCEL_COUNT=0
+            for BUILD_ID in $BUILD_IDS; do
+              echo "🚫 Canceling build $BUILD_ID..."
+              RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${ADO_TOKEN}" \
+                -d '{"status": "Cancelling"}' \
+                "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds/${BUILD_ID}?api-version=7.0")
+              
+              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                echo "  ✅ Canceled build $BUILD_ID"
+                CANCEL_COUNT=$((CANCEL_COUNT + 1))
+              else
+                echo "  ⚠️ Failed to cancel build $BUILD_ID (HTTP $HTTP_CODE)"
+              fi
+            done
+            echo "🏁 Canceled $CANCEL_COUNT build(s)"
+          fi
+
+      - name: Update GitHub Commit Status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
+          SOURCE_REPO: ${{ steps.pr-info.outputs.source_repo }}
+          COMMIT_SHA: ${{ steps.pr-info.outputs.commit_sha }}
+        run: |
+          curl -s -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/statuses/${COMMIT_SHA}" \
+            -d '{
+              "state": "error",
+              "description": "PR closed - build cancelled",
+              "context": "ADO Build"
+            }'
+          echo "✅ Updated commit status to cancelled"
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
