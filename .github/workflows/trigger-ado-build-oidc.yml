@@ -105,12 +105,22 @@ jobs:
 
           PR_MAP=$(jq -n --arg repo "$REPO_NAME" --arg branch "$BRANCH_NAME" '{($repo): $branch}')
 
+          # FunSDK is the primary repo checked out via ADO resources.repositories
+          # (all other repos are cloned by bob). When FunSDK itself is the PR source,
+          # we must tell ADO to check out the PR branch instead of the default (master).
+          if [[ "$REPO_NAME" == "FunSDK-small" ]]; then
+            FUNSDK_BRANCH="$BRANCH_NAME"
+          else
+            FUNSDK_BRANCH="master"
+          fi
+
           JSON_PAYLOAD=$(jq -n \
             --arg repo "$REPO_NAME" \
             --arg pr "$PR_NUMBER" \
             --arg branch "$BRANCH_NAME" \
             --arg commitSha "$COMMIT_SHA" \
             --arg runName "$RUN_NAME_SHORT" \
+            --arg funsdk "$FUNSDK_BRANCH" \
             --argjson prMap "$PR_MAP" \
             '{
               templateParameters: {
@@ -119,6 +129,7 @@ jobs:
                 github_branch: $branch,
                 github_commit_sha: $commitSha,
                 runName: $runName,
+                funsdk_branch: $funsdk,
                 pr_map: ($prMap | tojson)
               }
             }')
