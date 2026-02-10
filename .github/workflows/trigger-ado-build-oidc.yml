@@ -121,7 +121,7 @@ jobs:
             --arg commitSha "$COMMIT_SHA" \
             --arg runName "$RUN_NAME_SHORT" \
             --arg funsdk "$FUNSDK_BRANCH" \
-            --argjson prMap "$PR_MAP" \
+            --argjson branchOverrides "$PR_MAP" \
             '{
               templateParameters: {
                 github_repo: $repo,
@@ -130,7 +130,7 @@ jobs:
                 github_commit_sha: $commitSha,
                 runName: $runName,
                 funsdk_branch: $funsdk,
-                pr_map: ($prMap | tojson)
+                branch_overrides: ($branchOverrides | tojson)
               }
             }')
 
