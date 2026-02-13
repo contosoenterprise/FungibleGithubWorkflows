@@ -25,6 +25,7 @@ jobs:
           echo "repo_name=${{ github.event.client_payload.repo_name }}" >> $GITHUB_OUTPUT
           echo "repo_owner=${{ github.event.client_payload.repo_owner }}" >> $GITHUB_OUTPUT
           echo "branch_name=${{ github.event.client_payload.branch_name }}" >> $GITHUB_OUTPUT
+          echo "target_branch=${{ github.event.client_payload.target_branch }}" >> $GITHUB_OUTPUT
           echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
           echo "pr_user=${{ github.event.client_payload.pr_user }}" >> $GITHUB_OUTPUT
           echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
@@ -34,6 +35,7 @@ jobs:
           echo "  Repository: ${{ github.event.client_payload.repo_name }}"
           echo "  PR Number: ${{ github.event.client_payload.pr_number }}"
           echo "  Branch: ${{ github.event.client_payload.branch_name }}"
+          echo "  Target: ${{ github.event.client_payload.target_branch }}"
           echo "  Commit: ${{ github.event.client_payload.commit_sha }}"
           echo "  User: ${{ github.event.client_payload.pr_user }}"
 
@@ -98,6 +100,7 @@ jobs:
           REPO_NAME="${{ steps.pr-info.outputs.repo_name }}"
           PR_NUMBER="${{ steps.pr-info.outputs.pr_number }}"
           BRANCH_NAME="${{ steps.pr-info.outputs.branch_name }}"
+          TARGET_BRANCH="${{ steps.pr-info.outputs.target_branch }}"
 
           RUN_NAME="${REPO_NAME} - PR ${PR_NUMBER} - ${PR_USER} - ${COMMIT_SHA:0:7}"
           RUN_NAME_SANITIZED=$(echo "$RUN_NAME" | tr -d '#' | tr ':/' '--')
@@ -107,9 +110,12 @@ jobs:
 
           # FunSDK is the primary repo checked out via ADO resources.repositories
           # (all other repos are cloned by bob). When FunSDK itself is the PR source,
-          # we must tell ADO to check out the PR branch instead of the default (master).
+          # we must tell ADO to check out the PR branch instead of the default.
+          # When targeting a hotfix branch, FunSDK should also be on that branch.
           if [[ "$REPO_NAME" == "FunSDK-small" ]]; then
             FUNSDK_BRANCH="$BRANCH_NAME"
+          elif [[ -n "$TARGET_BRANCH" && "$TARGET_BRANCH" != "master" && "$TARGET_BRANCH" != "main" ]]; then
+            FUNSDK_BRANCH="$TARGET_BRANCH"
           else
             FUNSDK_BRANCH="master"
           fi
@@ -118,6 +124,7 @@ jobs:
             --arg repo "$REPO_NAME" \
             --arg pr "$PR_NUMBER" \
             --arg branch "$BRANCH_NAME" \
+            --arg targetBranch "$TARGET_BRANCH" \
             --arg commitSha "$COMMIT_SHA" \
             --arg runName "$RUN_NAME_SHORT" \
             --arg funsdk "$FUNSDK_BRANCH" \
@@ -127,6 +134,7 @@ jobs:
                 github_repo: $repo,
                 github_pr_number: $pr,
                 github_branch: $branch,
+                github_target_branch: $targetBranch,
                 github_commit_sha: $commitSha,
                 runName: $runName,
                 funsdk_branch: $funsdk,
