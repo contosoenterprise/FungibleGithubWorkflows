@@ -114,7 +114,7 @@ jobs:
           # When targeting a hotfix branch, FunSDK should also be on that branch.
           if [[ "$REPO_NAME" == "FunSDK-small" ]]; then
             FUNSDK_BRANCH="$BRANCH_NAME"
-          elif [[ -n "$TARGET_BRANCH" && "$TARGET_BRANCH" != "master" && "$TARGET_BRANCH" != "main" ]]; then
+          elif [[ "$TARGET_BRANCH" =~ ^hotfix_.+ || "$TARGET_BRANCH" == "stable" || "$TARGET_BRANCH" =~ ^rel_.+ ]]; then
             FUNSDK_BRANCH="$TARGET_BRANCH"
           else
             FUNSDK_BRANCH="master"
