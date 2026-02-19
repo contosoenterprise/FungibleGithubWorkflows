@@ -114,7 +114,7 @@ jobs:
             --arg runName "$SANITIZED_RUN_NAME" \
             --arg github_repo "$REPO_NAME" \
             --arg github_branch "$BRANCH_NAME" \
-            '{templateParameters: {runName: $runName, github_repo: $github_repo, github_branch: $github_branch}}')
+            '{templateParameters: {runName: $runName, github_repo: $github_repo, github_branch: $github_branch, do_tagging: "true"}}')
 
           echo "Payload: $JSON_PAYLOAD"
 
