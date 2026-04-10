@@ -1,0 +1,22 @@
+# Placeholder — will be updated in a follow-up PR
+# Receives dispatch from source repos when a hotfix_* branch is created,
+# then creates matching branches across all ~45 fungible-inc repos
+# and updates Jenkinsfiles to point to FunJenkins@hotfix_NNNNN
+name: Propagate Hotfix Branches
+
+on:
+  repository_dispatch:
+    types: [propagate-hotfix-branches]
+  workflow_dispatch:
+    inputs:
+      hotfix_number:
+        description: 'Hotfix build number (e.g. 24949)'
+        required: true
+        type: string
+
+jobs:
+  placeholder:
+    if: false  # never runs
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "placeholder"
