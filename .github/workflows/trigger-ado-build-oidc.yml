@@ -239,6 +239,35 @@ jobs:
             -d "$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')"
           echo "✅ Created PR comment for build ${ADO_BUILD_ID}"
 
+          # Clean up stale "Queued" comments from builds that were canceled
+          # before their comment could be marked superseded (race condition
+          # between concurrent workflow runs).
+          COMMENTS=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments?per_page=100")
+
+          STALE_IDS=$(echo "$COMMENTS" | jq -r --arg bid "$ADO_BUILD_ID" \
+            '[.[] | select(.body | (contains("ADO Build") and contains("Queued") and (contains("Superseded") | not) and (contains("[" + $bid + "]") | not)))] | .[].id')
+
+          for STALE_ID in $STALE_IDS; do
+            # Extract the build ID from the stale comment to keep the link
+            STALE_BID=$(echo "$COMMENTS" | jq -r --arg sid "$STALE_ID" \
+              '.[] | select(.id == ($sid | tonumber)) | .body' | grep -oE '\[([0-9]+)\]' | head -1 | tr -d '[]')
+            STALE_URL="https://dev.azure.com/AzureCSI/Fungible/_build/results?buildId=${STALE_BID}"
+            STALE_BODY="## ⚠️ ADO Build Canceled
+
+          **Build ID:** [${STALE_BID}](${STALE_URL})
+          **Status:** 🟡 Superseded by newer push"
+
+            curl -s -X PATCH \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${STALE_ID}" \
+              -d "$(jq -n --arg body "$STALE_BODY" '{body: $body}')"
+            echo "📝 Marked stale comment ${STALE_ID} (build ${STALE_BID}) as superseded"
+          done
+
       - name: Azure Logout
         if: always()
         run: az logout
