@@ -60,6 +60,8 @@ jobs:
         env:
           ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
           PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
+          SOURCE_REPO: ${{ steps.pr-info.outputs.source_repo }}
         run: |
           echo "🔍 Checking for previous in-progress builds for PR #${PR_NUMBER}..."
           
@@ -80,6 +82,12 @@ jobs:
           if [ -z "$BUILD_IDS" ]; then
             echo "✅ No previous in-progress builds found for this PR"
           else
+            # Fetch PR comments once for marking superseded builds
+            COMMENTS=$(curl -s \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments?per_page=100")
+
             for BUILD_ID in $BUILD_IDS; do
               echo "🚫 Canceling build $BUILD_ID..."
               curl -s -X PATCH \
@@ -87,6 +95,25 @@ jobs:
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
                 -d '{"status": "Cancelling"}' \
                 "https://dev.azure.com/AzureCSI/Fungible/_apis/build/builds/${BUILD_ID}?api-version=7.0" > /dev/null
+
+              # Mark the GitHub PR comment for this build as superseded
+              COMMENT_ID=$(echo "$COMMENTS" | jq -r --arg bid "$BUILD_ID" \
+                '.[] | select(.body | contains("[" + $bid + "]")) | .id' | head -1)
+
+              if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
+                ADO_BUILD_URL="https://dev.azure.com/AzureCSI/Fungible/_build/results?buildId=${BUILD_ID}"
+                BODY="## ⚠️ ADO Build Canceled
+
+          **Build ID:** [${BUILD_ID}](${ADO_BUILD_URL})
+          **Status:** 🟡 Superseded by newer push"
+
+                curl -s -X PATCH \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${COMMENT_ID}" \
+                  -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+                echo "📝 Updated comment for superseded build ${BUILD_ID}"
+              fi
             done
           fi
 
@@ -194,15 +221,9 @@ jobs:
             }"
           echo "✅ Created pending commit status on source repo"
 
-          # Check for existing ADO Build comment
-          COMMENTS=$(curl -s \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments")
-
-          EXISTING_COMMENT_ID=$(echo "$COMMENTS" | jq -r '.[] | select(.body | contains("ADO Build") and contains("Build ID:")) | .id' | head -1)
-
-          # Build comment body
+          # Always create a new comment for each build.
+          # update_github_comment.py will find and update this specific
+          # comment by matching on the build ID.
           COMMENT_BODY="## 🚀 ADO Build Started
 
           **Build ID:** [${ADO_BUILD_ID}](${ADO_URL})
@@ -211,26 +232,12 @@ jobs:
 
           _This comment will be updated when the build completes._"
 
-          # Escape for JSON
-          COMMENT_JSON=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
-
-          if [ -n "$EXISTING_COMMENT_ID" ] && [ "$EXISTING_COMMENT_ID" != "null" ]; then
-            # Update existing comment
-            curl -s -X PATCH \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
-              -d "$COMMENT_JSON"
-            echo "✅ Updated existing PR comment ${EXISTING_COMMENT_ID}"
-          else
-            # Create new comment
-            curl -s -X POST \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" \
-              -d "$COMMENT_JSON"
-            echo "✅ Created new PR comment"
-          fi
+          curl -s -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments" \
+            -d "$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')"
+          echo "✅ Created PR comment for build ${ADO_BUILD_ID}"
 
       - name: Azure Logout
         if: always()
