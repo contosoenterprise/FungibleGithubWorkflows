@@ -14,7 +14,7 @@ permissions:
 jobs:
   cancel-ado-build:
     name: Cancel ADO Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     environment: copilot
 
     steps:

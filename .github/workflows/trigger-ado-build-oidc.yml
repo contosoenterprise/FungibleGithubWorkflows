@@ -14,7 +14,7 @@ permissions:
 jobs:
   trigger-ado-build:
     name: Trigger ADO Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     environment: copilot
 
     steps:
