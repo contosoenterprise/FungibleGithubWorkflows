@@ -1,49 +1,38 @@
-# Reusable workflow: Require ADO Bug ID in PR Title
-# Validates that the PR title contains an ADO work item ID and confirms
-# the work item exists at https://dev.azure.com/AzureCSI/Fungible/
+# Verify ADO Bug ID exists
+# Receives dispatch from fungible-inc/GitHubWorkflows, authenticates via OIDC,
+# and checks that the work item exists at https://dev.azure.com/AzureCSI/Fungible/
+# Reports result back as a commit status on the source repo
 
-name: Require ADO Bug ID
+name: Verify ADO Bug ID
 
 on:
-  workflow_call:
+  repository_dispatch:
+    types: [verify-ado-bug-id]
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  check-title:
-    name: Require ADO Bug ID
+  verify-ado:
+    name: Verify ADO Bug ID
     runs-on: ubuntu-slim
     environment: copilot
 
     steps:
-      - name: Extract ADO bug ID from PR title
-        id: extract
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
+      - name: Extract Dispatch Information
+        id: info
         run: |
-          # Accepted formats (no bare numbers):
-          #   (#1234567)        — parenthesized hash
-          #   #1234567          — hash prefix
-          #   ADO#1234567       — ADO hash prefix
-          #   ADO-1234567       — ADO dash prefix
-          #   ADO 1234567       — ADO space prefix
+          echo "bug_id=${{ github.event.client_payload.bug_id }}" >> $GITHUB_OUTPUT
+          echo "pr_number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
+          echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
 
-          bug_id=$(echo "$PR_TITLE" | grep -oEi '\(#([0-9]{5,})\)|#([0-9]{5,})|ADO[# -]([0-9]{5,})' | head -1 | grep -oE '[0-9]{5,}' | head -1)
-
-          if [ -z "$bug_id" ]; then
-            echo "::error::PR title must contain an ADO bug ID."
-            echo ""
-            echo "Accepted formats:"
-            echo "  (#1234567)  #1234567  ADO#1234567  ADO-1234567  ADO 1234567"
-            echo ""
-            echo "Current title: $PR_TITLE"
-            exit 1
-          fi
-
-          echo "bug_id=$bug_id" >> "$GITHUB_OUTPUT"
-          echo "📋 Found ADO bug ID: $bug_id"
+          echo "📋 Received Dispatch:"
+          echo "  Bug ID: ${{ github.event.client_payload.bug_id }}"
+          echo "  Source: ${{ github.event.client_payload.source_repo }}"
+          echo "  PR #${{ github.event.client_payload.pr_number }}"
+          echo "  Commit: ${{ github.event.client_payload.commit_sha }}"
 
       - name: Azure Login via OIDC
         uses: azure/login@v3
@@ -63,9 +52,10 @@ jobs:
           echo "✅ Obtained Azure DevOps access token"
 
       - name: Verify work item exists in ADO
+        id: verify
         env:
           ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
-          BUG_ID: ${{ steps.extract.outputs.bug_id }}
+          BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
           ado_url="https://dev.azure.com/AzureCSI/Fungible/_apis/wit/workitems/${BUG_ID}?api-version=7.1"
 
@@ -81,19 +71,82 @@ jobs:
             echo "   Type:  $type"
             echo "   Title: $title"
             echo "   State: $state"
-            echo ""
             echo "   https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "description=${type}: ${title}" >> "$GITHUB_OUTPUT"
           elif [ "$http_code" -eq 404 ]; then
             echo "::error::ADO work item ${BUG_ID} does not exist."
-            echo "Checked: https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
-            exit 1
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "description=Work item ${BUG_ID} not found in ADO" >> "$GITHUB_OUTPUT"
           elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-            echo "::error::Authentication failed checking ADO work item ${BUG_ID}. Verify OIDC credentials have ADO access."
-            exit 1
+            echo "::error::Authentication failed checking ADO work item ${BUG_ID}."
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "description=Auth failed checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Unexpected response (HTTP ${http_code}) checking ADO work item ${BUG_ID}."
             cat /tmp/ado_response.json
-            exit 1
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "description=HTTP ${http_code} checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
           fi
 
           rm -f /tmp/ado_response.json
+
+      - name: Report status and update PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
+          STATUS: ${{ steps.verify.outputs.status }}
+          DESCRIPTION: ${{ steps.verify.outputs.description }}
+          SHA: ${{ steps.info.outputs.commit_sha }}
+          SOURCE_REPO: ${{ steps.info.outputs.source_repo }}
+          PR_NUMBER: ${{ steps.info.outputs.pr_number }}
+          BUG_ID: ${{ steps.info.outputs.bug_id }}
+        run: |
+          ADO_URL="https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
+
+          # Update commit status
+          curl --silent --max-time 10 -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/statuses/${SHA}" \
+            --data "$(jq -n \
+              --arg state "$STATUS" \
+              --arg desc "$DESCRIPTION" \
+              --arg url "$ADO_URL" \
+              --arg ctx "ADO Bug Verification" \
+              '{state: $state, description: $desc, target_url: $url, context: $ctx}')"
+
+          echo "📋 Reported status '${STATUS}' to ${SOURCE_REPO} @ ${SHA}"
+
+          # Update the PR comment left by the check-title job
+          MARKER="<!-- ado-bug-id-check -->"
+
+          if [ "$STATUS" = "success" ]; then
+            BODY="${MARKER}
+          ## ✅ ADO Bug ID Verified: [${BUG_ID}](${ADO_URL})
+
+          **${DESCRIPTION}**"
+          else
+            BODY="${MARKER}
+          ## ❌ ADO Bug ID Verification Failed
+
+          **Bug ID:** [${BUG_ID}](${ADO_URL})
+          **Error:** ${DESCRIPTION}
+
+          Please check that the work item ID in your PR title is correct."
+          fi
+
+          EXISTING=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            | jq -r ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            curl -s -X PATCH \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${EXISTING}" \
+              -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+            echo "📝 Updated PR comment with verification result"
+          fi
