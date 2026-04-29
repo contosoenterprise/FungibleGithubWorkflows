@@ -22,7 +22,6 @@ jobs:
     env:
       ADO_ENDPOINTS: >-
         https://dev.azure.com/AzureCSI/Fungible
-        https://msazure.visualstudio.com/One
 
     steps:
       - name: Extract dispatch payload
@@ -112,10 +111,11 @@ jobs:
           done
 
           if [ "$found" = false ]; then
-            echo "::error::ADO work item ${BUG_ID} not found in any known ADO project."
-            echo "status=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Work item ${BUG_ID} not found in any ADO project" >> "$GITHUB_OUTPUT"
+            echo "⚠️ ADO work item ${BUG_ID} not found in any accessible ADO project."
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "description=Work item ${BUG_ID} not found in accessible projects" >> "$GITHUB_OUTPUT"
             echo "ado_url=" >> "$GITHUB_OUTPUT"
+            echo "unverified=true" >> "$GITHUB_OUTPUT"
           fi
 
           rm -f /tmp/ado_response.json
@@ -132,6 +132,7 @@ jobs:
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
           ADO_URL="${{ steps.verify.outputs.ado_url }}"
+          UNVERIFIED="${{ steps.verify.outputs.unverified }}"
           MARKER="<!-- ado-bug-id-check -->"
 
           # Set commit status
@@ -152,7 +153,13 @@ jobs:
             --data "$status_data"
 
           # Build comment body
-          if [ "$STATUS" = "success" ]; then
+          if [ "$STATUS" = "success" ] && [ "$UNVERIFIED" = "true" ]; then
+            BODY="${MARKER}
+          ## ⚠️ ADO Bug ID: **${BUG_ID}**
+
+          Work item **${BUG_ID}** was not found in any ADO project the bot has access to.
+          It may exist in another project — please verify the ID is correct."
+          elif [ "$STATUS" = "success" ]; then
             BODY="${MARKER}
           ## ✅ ADO Bug ID Verified: [${BUG_ID}](${ADO_URL})
 
