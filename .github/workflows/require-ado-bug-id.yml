@@ -18,6 +18,12 @@ jobs:
     runs-on: ubuntu-slim
     environment: copilot
 
+    # Add new ADO org/project endpoints here (one per line, space-separated)
+    env:
+      ADO_ENDPOINTS: >-
+        https://dev.azure.com/AzureCSI/Fungible
+        https://msazure.visualstudio.com/One
+
     steps:
       - name: Extract dispatch payload
         id: info
@@ -52,42 +58,52 @@ jobs:
           ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
-          http_code=$(curl --silent --max-time 10 \
-            --output /tmp/ado_response.json --write-out "%{http_code}" \
-            -H "Authorization: Bearer ${ADO_TOKEN}" \
-            "https://dev.azure.com/AzureCSI/Fungible/_apis/wit/workitems/${BUG_ID}?api-version=7.1")
+          # ADO_ENDPOINTS is defined at job level — add new orgs there
+          read -ra endpoints <<< "$ADO_ENDPOINTS"
 
-          case "$http_code" in
-            200)
+          found=false
+          for endpoint in "${endpoints[@]}"; do
+            echo "🔍 Checking ${endpoint}..."
+            http_code=$(curl --silent --max-time 10 \
+              --output /tmp/ado_response.json --write-out "%{http_code}" \
+              -H "Authorization: Bearer ${ADO_TOKEN}" \
+              "${endpoint}/_apis/wit/workitems/${BUG_ID}?api-version=7.1")
+
+            if [ "$http_code" -eq 200 ]; then
               title=$(jq -r '.fields["System.Title"] // "Unknown"' /tmp/ado_response.json)
               state=$(jq -r '.fields["System.State"] // "Unknown"' /tmp/ado_response.json)
               type=$(jq -r '.fields["System.WorkItemType"] // "Unknown"' /tmp/ado_response.json)
               echo "✅ ADO work item ${BUG_ID}: ${type} — ${title} [${state}]"
               echo "status=success" >> "$GITHUB_OUTPUT"
               echo "description=${type}: ${title}" >> "$GITHUB_OUTPUT"
-              ;;
-            400)
+              echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}" >> "$GITHUB_OUTPUT"
+              found=true
+              break
+            elif [ "$http_code" -eq 400 ]; then
               echo "::error::ADO rejected work item ID ${BUG_ID} as invalid."
               echo "status=failure" >> "$GITHUB_OUTPUT"
               echo "description=Invalid work item ID ${BUG_ID}" >> "$GITHUB_OUTPUT"
-              ;;
-            404)
-              echo "::error::ADO work item ${BUG_ID} does not exist."
-              echo "status=failure" >> "$GITHUB_OUTPUT"
-              echo "description=Work item ${BUG_ID} not found in ADO" >> "$GITHUB_OUTPUT"
-              ;;
-            401|403)
-              echo "::error::Authentication failed checking ADO work item ${BUG_ID}."
-              echo "status=error" >> "$GITHUB_OUTPUT"
-              echo "description=Auth failed checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "::error::Unexpected response (HTTP ${http_code}) checking ADO work item ${BUG_ID}."
-              cat /tmp/ado_response.json
-              echo "status=error" >> "$GITHUB_OUTPUT"
-              echo "description=HTTP ${http_code} checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
+              echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}" >> "$GITHUB_OUTPUT"
+              found=true
+              break
+            elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+              echo "⚠️  No access to ${endpoint} (HTTP ${http_code}), skipping..."
+              continue
+            elif [ "$http_code" -eq 404 ]; then
+              echo "   Not found in ${endpoint}"
+              continue
+            else
+              echo "⚠️  Unexpected response (HTTP ${http_code}) from ${endpoint}, skipping..."
+              continue
+            fi
+          done
+
+          if [ "$found" = false ]; then
+            echo "::error::ADO work item ${BUG_ID} not found in any known ADO project."
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "description=Work item ${BUG_ID} not found in any ADO project" >> "$GITHUB_OUTPUT"
+            echo "ado_url=" >> "$GITHUB_OUTPUT"
+          fi
 
           rm -f /tmp/ado_response.json
 
@@ -102,19 +118,25 @@ jobs:
           PR_NUMBER: ${{ steps.info.outputs.pr_number }}
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
-          ADO_URL="https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
+          ADO_URL="${{ steps.verify.outputs.ado_url }}"
           MARKER="<!-- ado-bug-id-check -->"
 
           # Set commit status
+          status_data=$(jq -n \
+            --arg state "$STATUS" \
+            --arg desc "$DESCRIPTION" \
+            --arg url "$ADO_URL" \
+            'if $url != "" then
+              {state: $state, description: $desc, target_url: $url, context: "ADO Bug Verification"}
+            else
+              {state: $state, description: $desc, context: "ADO Bug Verification"}
+            end')
+
           curl --silent --max-time 10 -X POST \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://api.github.com/repos/${SOURCE_REPO}/statuses/${SHA}" \
-            --data "$(jq -n \
-              --arg state "$STATUS" \
-              --arg desc "$DESCRIPTION" \
-              --arg url "$ADO_URL" \
-              '{state: $state, description: $desc, target_url: $url, context: "ADO Bug Verification"}')"
+            --data "$status_data"
 
           # Build comment body
           if [ "$STATUS" = "success" ]; then
@@ -122,11 +144,19 @@ jobs:
           ## ✅ ADO Bug ID Verified: [${BUG_ID}](${ADO_URL})
 
           **${DESCRIPTION}**"
-          else
+          elif [ -n "$ADO_URL" ]; then
             BODY="${MARKER}
           ## ❌ ADO Bug ID Verification Failed
 
           **Bug ID:** [${BUG_ID}](${ADO_URL})
+          **Error:** ${DESCRIPTION}
+
+          Please check that the work item ID in your PR title is correct."
+          else
+            BODY="${MARKER}
+          ## ❌ ADO Bug ID Verification Failed
+
+          **Bug ID:** ${BUG_ID}
           **Error:** ${DESCRIPTION}
 
           Please check that the work item ID in your PR title is correct."
