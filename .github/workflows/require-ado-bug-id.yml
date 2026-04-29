@@ -64,10 +64,23 @@ jobs:
           found=false
           for endpoint in "${endpoints[@]}"; do
             echo "🔍 Checking ${endpoint}..."
-            http_code=$(curl --silent --max-time 10 \
-              --output /tmp/ado_response.json --write-out "%{http_code}" \
-              -H "Authorization: Bearer ${ADO_TOKEN}" \
-              "${endpoint}/_apis/wit/workitems/${BUG_ID}?api-version=7.1")
+
+            # Retry up to 3 times on 429 (rate limit)
+            for attempt in 1 2 3; do
+              http_code=$(curl --silent --max-time 10 \
+                --output /tmp/ado_response.json --write-out "%{http_code}" \
+                -H "Authorization: Bearer ${ADO_TOKEN}" \
+                "${endpoint}/_apis/wit/workitems/${BUG_ID}?api-version=7.1")
+
+              if [ "$http_code" -eq 429 ]; then
+                retry_after=$(jq -r '.retryAfter // empty' /tmp/ado_response.json 2>/dev/null)
+                wait_secs=${retry_after:-$((attempt * 5))}
+                echo "⏳ Rate limited by ${endpoint}, retrying in ${wait_secs}s (attempt ${attempt}/3)..."
+                sleep "$wait_secs"
+              else
+                break
+              fi
+            done
 
             if [ "$http_code" -eq 200 ]; then
               title=$(jq -r '.fields["System.Title"] // "Unknown"' /tmp/ado_response.json)
