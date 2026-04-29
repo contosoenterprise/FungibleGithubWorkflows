@@ -1,7 +1,6 @@
-# Verify ADO Bug ID exists
+# Verify ADO Bug ID exists via OIDC
 # Receives dispatch from fungible-inc/GitHubWorkflows, authenticates via OIDC,
-# and checks that the work item exists at https://dev.azure.com/AzureCSI/Fungible/
-# Reports result back as a commit status on the source repo
+# checks the work item exists in ADO, and reports back to the source PR
 
 name: Verify ADO Bug ID
 
@@ -20,7 +19,7 @@ jobs:
     environment: copilot
 
     steps:
-      - name: Extract Dispatch Information
+      - name: Extract dispatch payload
         id: info
         run: |
           echo "bug_id=${{ github.event.client_payload.bug_id }}" >> $GITHUB_OUTPUT
@@ -28,11 +27,8 @@ jobs:
           echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
           echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
 
-          echo "📋 Received Dispatch:"
-          echo "  Bug ID: ${{ github.event.client_payload.bug_id }}"
-          echo "  Source: ${{ github.event.client_payload.source_repo }}"
-          echo "  PR #${{ github.event.client_payload.pr_number }}"
-          echo "  Commit: ${{ github.event.client_payload.commit_sha }}"
+          echo "📋 Received: Bug #${{ github.event.client_payload.bug_id }}"
+          echo "   Source: ${{ github.event.client_payload.source_repo }} PR #${{ github.event.client_payload.pr_number }}"
 
       - name: Azure Login via OIDC
         uses: azure/login@v3
@@ -41,7 +37,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Get Azure DevOps Access Token
+      - name: Get Azure DevOps access token
         id: get-token
         run: |
           ACCESS_TOKEN=$(az account get-access-token \
@@ -49,7 +45,6 @@ jobs:
             --query accessToken -o tsv)
           echo "::add-mask::$ACCESS_TOKEN"
           echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-          echo "✅ Obtained Azure DevOps access token"
 
       - name: Verify work item exists in ADO
         id: verify
@@ -57,45 +52,46 @@ jobs:
           ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
-          ado_url="https://dev.azure.com/AzureCSI/Fungible/_apis/wit/workitems/${BUG_ID}?api-version=7.1"
-
-          http_code=$(curl --silent --max-time 10 --output /tmp/ado_response.json --write-out "%{http_code}" \
+          http_code=$(curl --silent --max-time 10 \
+            --output /tmp/ado_response.json --write-out "%{http_code}" \
             -H "Authorization: Bearer ${ADO_TOKEN}" \
-            "$ado_url")
+            "https://dev.azure.com/AzureCSI/Fungible/_apis/wit/workitems/${BUG_ID}?api-version=7.1")
 
-          if [ "$http_code" -eq 200 ]; then
-            title=$(jq -r '.fields["System.Title"] // "Unknown"' /tmp/ado_response.json)
-            state=$(jq -r '.fields["System.State"] // "Unknown"' /tmp/ado_response.json)
-            type=$(jq -r '.fields["System.WorkItemType"] // "Unknown"' /tmp/ado_response.json)
-            echo "✅ ADO work item ${BUG_ID} verified"
-            echo "   Type:  $type"
-            echo "   Title: $title"
-            echo "   State: $state"
-            echo "   https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
-            echo "status=success" >> "$GITHUB_OUTPUT"
-            echo "description=${type}: ${title}" >> "$GITHUB_OUTPUT"
-          elif [ "$http_code" -eq 404 ]; then
-            echo "::error::ADO work item ${BUG_ID} does not exist."
-            echo "status=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Work item ${BUG_ID} not found in ADO" >> "$GITHUB_OUTPUT"
-          elif [ "$http_code" -eq 400 ]; then
-            echo "::error::ADO rejected work item ID ${BUG_ID} as invalid."
-            echo "status=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Invalid work item ID ${BUG_ID}" >> "$GITHUB_OUTPUT"
-          elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-            echo "::error::Authentication failed checking ADO work item ${BUG_ID}."
-            echo "status=error" >> "$GITHUB_OUTPUT"
-            echo "description=Auth failed checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected response (HTTP ${http_code}) checking ADO work item ${BUG_ID}."
-            cat /tmp/ado_response.json
-            echo "status=error" >> "$GITHUB_OUTPUT"
-            echo "description=HTTP ${http_code} checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
-          fi
+          case "$http_code" in
+            200)
+              title=$(jq -r '.fields["System.Title"] // "Unknown"' /tmp/ado_response.json)
+              state=$(jq -r '.fields["System.State"] // "Unknown"' /tmp/ado_response.json)
+              type=$(jq -r '.fields["System.WorkItemType"] // "Unknown"' /tmp/ado_response.json)
+              echo "✅ ADO work item ${BUG_ID}: ${type} — ${title} [${state}]"
+              echo "status=success" >> "$GITHUB_OUTPUT"
+              echo "description=${type}: ${title}" >> "$GITHUB_OUTPUT"
+              ;;
+            400)
+              echo "::error::ADO rejected work item ID ${BUG_ID} as invalid."
+              echo "status=failure" >> "$GITHUB_OUTPUT"
+              echo "description=Invalid work item ID ${BUG_ID}" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "::error::ADO work item ${BUG_ID} does not exist."
+              echo "status=failure" >> "$GITHUB_OUTPUT"
+              echo "description=Work item ${BUG_ID} not found in ADO" >> "$GITHUB_OUTPUT"
+              ;;
+            401|403)
+              echo "::error::Authentication failed checking ADO work item ${BUG_ID}."
+              echo "status=error" >> "$GITHUB_OUTPUT"
+              echo "description=Auth failed checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unexpected response (HTTP ${http_code}) checking ADO work item ${BUG_ID}."
+              cat /tmp/ado_response.json
+              echo "status=error" >> "$GITHUB_OUTPUT"
+              echo "description=HTTP ${http_code} checking work item ${BUG_ID}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
           rm -f /tmp/ado_response.json
 
-      - name: Report status and update PR comment
+      - name: Report result to source repo
         if: always()
         env:
           GH_TOKEN: ${{ secrets.SOURCE_REPO_STATUS_TOKEN }}
@@ -107,8 +103,9 @@ jobs:
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
           ADO_URL="https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
+          MARKER="<!-- ado-bug-id-check -->"
 
-          # Update commit status
+          # Set commit status
           curl --silent --max-time 10 -X POST \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -117,14 +114,9 @@ jobs:
               --arg state "$STATUS" \
               --arg desc "$DESCRIPTION" \
               --arg url "$ADO_URL" \
-              --arg ctx "ADO Bug Verification" \
-              '{state: $state, description: $desc, target_url: $url, context: $ctx}')"
+              '{state: $state, description: $desc, target_url: $url, context: "ADO Bug Verification"}')"
 
-          echo "📋 Reported status '${STATUS}' to ${SOURCE_REPO} @ ${SHA}"
-
-          # Update the PR comment left by the check-title job
-          MARKER="<!-- ado-bug-id-check -->"
-
+          # Build comment body
           if [ "$STATUS" = "success" ]; then
             BODY="${MARKER}
           ## ✅ ADO Bug ID Verified: [${BUG_ID}](${ADO_URL})
@@ -140,10 +132,12 @@ jobs:
           Please check that the work item ID in your PR title is correct."
           fi
 
+          # Update existing PR comment (left by check-title job)
+          COMMENTS_URL="https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments"
           EXISTING=$(curl -s \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            "${COMMENTS_URL}?per_page=100" \
             | jq -r ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
 
           if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
@@ -152,5 +146,6 @@ jobs:
               -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${EXISTING}" \
               -d "$(jq -n --arg body "$BODY" '{body: $body}')"
-            echo "📝 Updated PR comment with verification result"
           fi
+
+          echo "📋 Reported '${STATUS}' to ${SOURCE_REPO} PR #${PR_NUMBER}"
