@@ -78,6 +78,10 @@ jobs:
             echo "::error::ADO work item ${BUG_ID} does not exist."
             echo "status=failure" >> "$GITHUB_OUTPUT"
             echo "description=Work item ${BUG_ID} not found in ADO" >> "$GITHUB_OUTPUT"
+          elif [ "$http_code" -eq 400 ]; then
+            echo "::error::ADO rejected work item ID ${BUG_ID} as invalid."
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "description=Invalid work item ID ${BUG_ID}" >> "$GITHUB_OUTPUT"
           elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
             echo "::error::Authentication failed checking ADO work item ${BUG_ID}."
             echo "status=error" >> "$GITHUB_OUTPUT"
