@@ -1,0 +1,99 @@
+# Reusable workflow: Require ADO Bug ID in PR Title
+# Validates that the PR title contains an ADO work item ID and confirms
+# the work item exists at https://dev.azure.com/AzureCSI/Fungible/
+
+name: Require ADO Bug ID
+
+on:
+  workflow_call:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  check-title:
+    name: Require ADO Bug ID
+    runs-on: ubuntu-slim
+    environment: copilot
+
+    steps:
+      - name: Extract ADO bug ID from PR title
+        id: extract
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Accepted formats (no bare numbers):
+          #   (#1234567)        — parenthesized hash
+          #   #1234567          — hash prefix
+          #   ADO#1234567       — ADO hash prefix
+          #   ADO-1234567       — ADO dash prefix
+          #   ADO 1234567       — ADO space prefix
+
+          bug_id=$(echo "$PR_TITLE" | grep -oEi '\(#([0-9]{5,})\)|#([0-9]{5,})|ADO[# -]([0-9]{5,})' | head -1 | grep -oE '[0-9]{5,}' | head -1)
+
+          if [ -z "$bug_id" ]; then
+            echo "::error::PR title must contain an ADO bug ID."
+            echo ""
+            echo "Accepted formats:"
+            echo "  (#1234567)  #1234567  ADO#1234567  ADO-1234567  ADO 1234567"
+            echo ""
+            echo "Current title: $PR_TITLE"
+            exit 1
+          fi
+
+          echo "bug_id=$bug_id" >> "$GITHUB_OUTPUT"
+          echo "📋 Found ADO bug ID: $bug_id"
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Azure DevOps Access Token
+        id: get-token
+        run: |
+          ACCESS_TOKEN=$(az account get-access-token \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+            --query accessToken -o tsv)
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Obtained Azure DevOps access token"
+
+      - name: Verify work item exists in ADO
+        env:
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+          BUG_ID: ${{ steps.extract.outputs.bug_id }}
+        run: |
+          ado_url="https://dev.azure.com/AzureCSI/Fungible/_apis/wit/workitems/${BUG_ID}?api-version=7.1"
+
+          http_code=$(curl --silent --max-time 10 --output /tmp/ado_response.json --write-out "%{http_code}" \
+            -H "Authorization: Bearer ${ADO_TOKEN}" \
+            "$ado_url")
+
+          if [ "$http_code" -eq 200 ]; then
+            title=$(jq -r '.fields["System.Title"] // "Unknown"' /tmp/ado_response.json)
+            state=$(jq -r '.fields["System.State"] // "Unknown"' /tmp/ado_response.json)
+            type=$(jq -r '.fields["System.WorkItemType"] // "Unknown"' /tmp/ado_response.json)
+            echo "✅ ADO work item ${BUG_ID} verified"
+            echo "   Type:  $type"
+            echo "   Title: $title"
+            echo "   State: $state"
+            echo ""
+            echo "   https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
+          elif [ "$http_code" -eq 404 ]; then
+            echo "::error::ADO work item ${BUG_ID} does not exist."
+            echo "Checked: https://dev.azure.com/AzureCSI/Fungible/_workitems/edit/${BUG_ID}"
+            exit 1
+          elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+            echo "::error::Authentication failed checking ADO work item ${BUG_ID}. Verify OIDC credentials have ADO access."
+            exit 1
+          else
+            echo "::error::Unexpected response (HTTP ${http_code}) checking ADO work item ${BUG_ID}."
+            cat /tmp/ado_response.json
+            exit 1
+          fi
+
+          rm -f /tmp/ado_response.json
