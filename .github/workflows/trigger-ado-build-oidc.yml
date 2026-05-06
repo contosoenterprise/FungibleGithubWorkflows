@@ -165,7 +165,9 @@ jobs:
                 github_commit_sha: $commitSha,
                 runName: $runName,
                 funsdk_branch: $funsdk,
-                branch_overrides: ($branchOverrides | tojson)
+                branch_overrides: ($branchOverrides | tojson),
+                enableMFGRelease: "true",
+                enableFatTarball: "true"
               }
             }')
 
