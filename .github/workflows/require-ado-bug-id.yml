@@ -103,6 +103,11 @@ jobs:
           for endpoint in "${endpoints[@]}"; do
             echo "🔍 Checking ${endpoint}..."
 
+            # Work item IDs are org-scoped, not project-scoped. Strip the trailing
+            # /<project> so the lookup resolves any item in the org; including the
+            # project in the path returns 404 when the item lives in another project.
+            org="${endpoint%/*}"
+
             # Retry up to 3 times on 429 (rate limit)
             for attempt in 1 2 3; do
               # `|| true` so a curl failure (e.g. timeout exit 28) doesn't abort
@@ -112,7 +117,7 @@ jobs:
               http_code=$(curl --silent --max-time 10 \
                 --output /tmp/ado_response.json --write-out "%{http_code}" \
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
-                "${endpoint}/_apis/wit/workitems/${BUG_ID}?api-version=7.1") || curl_err=$?
+                "${org}/_apis/wit/workitems/${BUG_ID}?api-version=7.1") || curl_err=$?
               http_code=${http_code:-000}
 
               if [ "$http_code" -eq 429 ]; then
