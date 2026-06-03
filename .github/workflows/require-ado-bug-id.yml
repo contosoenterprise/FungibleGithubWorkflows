@@ -54,6 +54,38 @@ jobs:
           echo "::add-mask::$ACCESS_TOKEN"
           echo "ado_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
 
+      - name: Probe ADO connectivity and authorization
+        env:
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+        run: |
+          # Diagnostic only — never fails the job. For each endpoint, hits the
+          # org's projects API to classify it as REACHABLE+AUTHORIZED,
+          # REACHABLE-but-UNAUTHORIZED, or UNREACHABLE (network/egress).
+          read -ra endpoints <<< "$ADO_ENDPOINTS"
+
+          for endpoint in "${endpoints[@]}"; do
+            # Strip the trailing /<project> to get the org root for the projects API
+            org="${endpoint%/*}"
+            echo "🔎 Probing ${org}..."
+
+            curl_err=0
+            http_code=$(curl --silent --max-time 10 \
+              --output /dev/null --write-out "%{http_code}" \
+              -H "Authorization: Bearer ${ADO_TOKEN}" \
+              "${org}/_apis/projects?api-version=7.1") || curl_err=$?
+            http_code=${http_code:-000}
+
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+              echo "   ✅ REACHABLE + AUTHORIZED (HTTP ${http_code}) — OIDC identity can access ${org}"
+            elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+              echo "   ⛔ REACHABLE but UNAUTHORIZED (HTTP ${http_code}) — federated identity is NOT a member of ${org}. Add it in ADO org settings."
+            elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
+              echo "   🌐 UNREACHABLE (curl exit ${curl_err}, no HTTP response) — network/egress problem reaching ${org}, not an auth issue."
+            else
+              echo "   ❓ Unexpected (HTTP ${http_code}, curl exit ${curl_err}) from ${org}."
+            fi
+          done
+
       - name: Verify work item exists in ADO
         id: verify
         env:
@@ -69,10 +101,15 @@ jobs:
 
             # Retry up to 3 times on 429 (rate limit)
             for attempt in 1 2 3; do
+              # `|| true` so a curl failure (e.g. timeout exit 28) doesn't abort
+              # the step under `bash -e`; capture the exit code to tell a network
+              # failure apart from an HTTP auth/permission response.
+              curl_err=0
               http_code=$(curl --silent --max-time 10 \
                 --output /tmp/ado_response.json --write-out "%{http_code}" \
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
-                "${endpoint}/_apis/wit/workitems/${BUG_ID}?api-version=7.1")
+                "${endpoint}/_apis/wit/workitems/${BUG_ID}?api-version=7.1") || curl_err=$?
+              http_code=${http_code:-000}
 
               if [ "$http_code" -eq 429 ]; then
                 retry_after=$(jq -r '.retryAfter // empty' /tmp/ado_response.json 2>/dev/null)
@@ -106,13 +143,16 @@ jobs:
               found=true
               break
             elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-              echo "⚠️  No access to ${endpoint} (HTTP ${http_code}), skipping..."
+              echo "⚠️  No access to ${endpoint} (HTTP ${http_code}) — the federated identity is reachable but not authorized for this org/project. Skipping..."
               continue
             elif [ "$http_code" -eq 404 ]; then
               echo "   Not found in ${endpoint}"
               continue
+            elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
+              echo "⚠️  Could not reach ${endpoint} (curl exit ${curl_err}, no HTTP response). This is a network/egress problem, not an auth failure. Skipping..."
+              continue
             else
-              echo "⚠️  Unexpected response (HTTP ${http_code}) from ${endpoint}, skipping..."
+              echo "⚠️  Unexpected response (HTTP ${http_code}, curl exit ${curl_err}) from ${endpoint}, skipping..."
               continue
             fi
           done
