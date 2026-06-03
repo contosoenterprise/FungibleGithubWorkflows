@@ -18,11 +18,15 @@ jobs:
     runs-on: ubuntu-slim
     environment: copilot
 
-    # Add new ADO org/project endpoints here (one per line, space-separated)
+    # Add new ADO org/project endpoints here (space-separated).
+    # Note: msazure is listed twice — the dev.azure.com host appears to be
+    # dropped from hosted runners, so the legacy *.visualstudio.com host is
+    # included as a fallback (same backend work item, identical REST API).
     env:
       ADO_ENDPOINTS: >-
         https://dev.azure.com/AzureCSI/Fungible
         https://dev.azure.com/msazure/One
+        https://msazure.visualstudio.com/One
 
     steps:
       - name: Extract dispatch payload
