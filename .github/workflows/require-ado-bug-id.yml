@@ -22,15 +22,18 @@ jobs:
     env:
       ADO_ENDPOINTS: >-
         https://dev.azure.com/AzureCSI/Fungible
+        https://dev.azure.com/msazure/One
 
     steps:
       - name: Extract dispatch payload
         id: info
         run: |
-          echo "bug_id=${{ github.event.client_payload.bug_id }}" >> $GITHUB_OUTPUT
-          echo "pr_number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
-          echo "commit_sha=${{ github.event.client_payload.commit_sha }}" >> $GITHUB_OUTPUT
-          echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+          {
+            echo "bug_id=${{ github.event.client_payload.bug_id }}"
+            echo "pr_number=${{ github.event.client_payload.pr_number }}"
+            echo "commit_sha=${{ github.event.client_payload.commit_sha }}"
+            echo "source_repo=${{ github.event.client_payload.source_repo }}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "📋 Received: Bug #${{ github.event.client_payload.bug_id }}"
           echo "   Source: ${{ github.event.client_payload.source_repo }} PR #${{ github.event.client_payload.pr_number }}"
@@ -49,7 +52,7 @@ jobs:
             --resource 499b84ac-1321-427f-aa17-267ca6975798 \
             --query accessToken -o tsv)
           echo "::add-mask::$ACCESS_TOKEN"
-          echo "ado_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "ado_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Verify work item exists in ADO
         id: verify
@@ -86,16 +89,20 @@ jobs:
               state=$(jq -r '.fields["System.State"] // "Unknown"' /tmp/ado_response.json)
               type=$(jq -r '.fields["System.WorkItemType"] // "Unknown"' /tmp/ado_response.json)
               echo "✅ ADO work item ${BUG_ID}: ${type} — ${title} [${state}]"
-              echo "status=success" >> "$GITHUB_OUTPUT"
-              echo "description=${type}: ${title}" >> "$GITHUB_OUTPUT"
-              echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}" >> "$GITHUB_OUTPUT"
+              {
+                echo "status=success"
+                echo "description=${type}: ${title}"
+                echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}"
+              } >> "$GITHUB_OUTPUT"
               found=true
               break
             elif [ "$http_code" -eq 400 ]; then
               echo "::error::ADO rejected work item ID ${BUG_ID} as invalid."
-              echo "status=failure" >> "$GITHUB_OUTPUT"
-              echo "description=Invalid work item ID ${BUG_ID}" >> "$GITHUB_OUTPUT"
-              echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}" >> "$GITHUB_OUTPUT"
+              {
+                echo "status=failure"
+                echo "description=Invalid work item ID ${BUG_ID}"
+                echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}"
+              } >> "$GITHUB_OUTPUT"
               found=true
               break
             elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
@@ -112,10 +119,12 @@ jobs:
 
           if [ "$found" = false ]; then
             echo "⚠️ ADO work item ${BUG_ID} not found in any accessible ADO project."
-            echo "status=success" >> "$GITHUB_OUTPUT"
-            echo "description=Work item ${BUG_ID} not found in accessible projects" >> "$GITHUB_OUTPUT"
-            echo "ado_url=" >> "$GITHUB_OUTPUT"
-            echo "unverified=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "status=success"
+              echo "description=Work item ${BUG_ID} not found in accessible projects"
+              echo "ado_url="
+              echo "unverified=true"
+            } >> "$GITHUB_OUTPUT"
           fi
 
           rm -f /tmp/ado_response.json
