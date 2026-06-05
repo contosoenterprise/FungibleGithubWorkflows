@@ -91,19 +91,28 @@ jobs:
               # token is honored and the problem is purely work-item/area-path
               # read permission; if it shows an anonymous/public identity the token
               # is being silently dropped for this org.
-              if curl --silent --max-time 25 --output /tmp/ado_conn.json \
+              #
+              # NOTE: connectionData is a *preview* API — it MUST be called with
+              # api-version=7.1-preview. Calling it as plain 7.1 returns a
+              # VssInvalidPreviewVersionException error body (not identity data),
+              # which makes authenticatedUser read as null.
+              conn_http=$(curl --silent --max-time 25 --output /tmp/ado_conn.json \
+                --write-out "%{http_code}" \
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
-                "${org}/_apis/connectionData?api-version=7.1"; then
+                "${org}/_apis/connectionData?api-version=7.1-preview") || conn_http=000
+              if [ "$conn_http" -ge 200 ] && [ "$conn_http" -lt 300 ]; then
                 auth_name=$(jq -r '.authenticatedUser.providerDisplayName // .authenticatedUser.customDisplayName // "Unknown"' /tmp/ado_conn.json 2>/dev/null)
-                auth_desc=$(jq -r '.authenticatedUser.subjectDescriptor // ""' /tmp/ado_conn.json 2>/dev/null)
+                auth_desc=$(jq -r '.authenticatedUser.subjectDescriptor // .authenticatedUser.descriptor // ""' /tmp/ado_conn.json 2>/dev/null)
                 auth_id=$(jq -r '.authenticatedUser.id // ""' /tmp/ado_conn.json 2>/dev/null)
                 echo "      • Identity ADO sees: ${auth_name}${auth_desc:+ (${auth_desc})}${auth_id:+ [id ${auth_id}]}"
-                case "$auth_desc" in
-                  Microsoft.IdentityModel.Claims.ClaimsIdentity*|"")
+                # An anonymous/public connection resolves to the well-known
+                # all-zero GUID; the bearer token is not being honored if so.
+                case "$auth_id" in
+                  00000000-0000-0000-0000-000000000000|"")
                     echo "      ⚠️  This looks like an anonymous/public identity — the bearer token may not be honored for ${org}." ;;
                 esac
               else
-                echo "      • Could not read connectionData to confirm the authenticated identity."
+                echo "      • Could not read connectionData (HTTP ${conn_http}) to confirm the authenticated identity."
               fi
               rm -f /tmp/ado_conn.json
             elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
