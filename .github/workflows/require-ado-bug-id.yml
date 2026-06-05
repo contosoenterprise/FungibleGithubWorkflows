@@ -19,14 +19,10 @@ jobs:
     environment: copilot
 
     # Add new ADO org/project endpoints here (space-separated).
-    # Note: msazure is listed twice — the dev.azure.com host appears to be
-    # dropped from hosted runners, so the legacy *.visualstudio.com host is
-    # included as a fallback (same backend work item, identical REST API).
     env:
       ADO_ENDPOINTS: >-
         https://dev.azure.com/AzureCSI/Fungible
         https://dev.azure.com/msazure/One
-        https://msazure.visualstudio.com/One
 
     steps:
       - name: Extract dispatch payload
@@ -57,198 +53,6 @@ jobs:
             --query accessToken -o tsv)
           echo "::add-mask::$ACCESS_TOKEN"
           echo "ado_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: Probe ADO connectivity and authorization
-        env:
-          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
-        run: |
-          # Diagnostic only — never fails the job. For each endpoint, hits the
-          # org's projects API to classify it as REACHABLE+AUTHORIZED,
-          # REACHABLE-but-UNAUTHORIZED, or UNREACHABLE (network/egress).
-          # On an unreachable host it additionally probes DNS + TCP connect so
-          # the failure self-classifies as "DNS fail" vs "TCP blocked" vs
-          # "connected but no HTTP response".
-
-          # Print the signed-in identity so the SP's home tenant/app shows up next
-          # to each org's resolved identity for an unambiguous side-by-side.
-          echo "🪪 Workflow signed in as:"
-          az account show \
-            --query "{tenantId: tenantId, user: user.name, userType: user.type}" \
-            -o json 2>/dev/null | sed 's/^/   /' \
-            || echo "   (could not read az account show)"
-
-          read -ra endpoints <<< "$ADO_ENDPOINTS"
-
-          for endpoint in "${endpoints[@]}"; do
-            # Strip the trailing /<project> to get the org root for the projects API
-            org="${endpoint%/*}"
-            echo "🔎 Probing ${org}..."
-
-            curl_err=0
-            http_code=$(curl --silent --max-time 25 \
-              --output /dev/null --write-out "%{http_code}" \
-              -H "Authorization: Bearer ${ADO_TOKEN}" \
-              "${org}/_apis/projects?api-version=7.1") || curl_err=$?
-            http_code=${http_code:-000}
-
-            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-              echo "   ✅ REACHABLE + AUTHORIZED (HTTP ${http_code}) — OIDC identity can access ${org}"
-
-              # Ask ADO who it thinks we are. connectionData.authenticatedUser is
-              # the single most useful signal for a TF401232 "exists or no
-              # permission" puzzle: if it shows the expected service principal the
-              # token is honored and the problem is purely work-item/area-path
-              # read permission; if it shows an anonymous/public identity the token
-              # is being silently dropped for this org.
-              #
-              # NOTE: connectionData is a *preview* API — it MUST be called with
-              # api-version=7.1-preview. Calling it as plain 7.1 returns a
-              # VssInvalidPreviewVersionException error body (not identity data),
-              # which makes authenticatedUser read as null.
-              conn_http=$(curl --silent --max-time 25 --output /tmp/ado_conn.json \
-                --write-out "%{http_code}" \
-                -H "Authorization: Bearer ${ADO_TOKEN}" \
-                "${org}/_apis/connectionData?api-version=7.1-preview") || conn_http=000
-              if [ "$conn_http" -ge 200 ] && [ "$conn_http" -lt 300 ]; then
-                auth_name=$(jq -r '.authenticatedUser.providerDisplayName // .authenticatedUser.customDisplayName // "Unknown"' /tmp/ado_conn.json 2>/dev/null)
-                auth_desc=$(jq -r '.authenticatedUser.subjectDescriptor // .authenticatedUser.descriptor // ""' /tmp/ado_conn.json 2>/dev/null)
-                auth_id=$(jq -r '.authenticatedUser.id // ""' /tmp/ado_conn.json 2>/dev/null)
-                echo "      • Identity ADO sees: ${auth_name}${auth_desc:+ (${auth_desc})}${auth_id:+ [id ${auth_id}]}"
-                # An anonymous/public connection resolves to the well-known
-                # all-zero GUID; the bearer token is not being honored if so.
-                case "$auth_id" in
-                  00000000-0000-0000-0000-000000000000|"")
-                    echo "      ⚠️  This looks like an anonymous/public identity — the bearer token may not be honored for ${org}." ;;
-                esac
-              else
-                echo "      • Could not read connectionData (HTTP ${conn_http}) to confirm the authenticated identity."
-              fi
-              rm -f /tmp/ado_conn.json
-            elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-              echo "   ⛔ REACHABLE but UNAUTHORIZED (HTTP ${http_code}) — federated identity is NOT a member of ${org}. Add it in ADO org settings."
-            elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
-              echo "   🌐 UNREACHABLE (curl exit ${curl_err}, no HTTP response) — network/egress problem reaching ${org}, not an auth issue."
-
-              # Drill into *why* it is unreachable. Pull the host out of the URL.
-              host="${org#*://}"
-              host="${host%%/*}"
-
-              # 1) DNS resolution
-              if resolved=$(getent hosts "$host" 2>/dev/null); then
-                echo "      • DNS: ✅ ${host} resolves to $(echo "$resolved" | awk '{print $1}' | paste -sd, -)"
-              else
-                echo "      • DNS: ❌ ${host} did NOT resolve — name resolution / DNS egress problem."
-              fi
-
-              # 2) TCP connect + TLS handshake timing (no request sent).
-              #    curl reports connect/appconnect times; a 0.000000 appconnect
-              #    with a non-zero connect means TLS was blocked, etc.
-              probe_err=0
-              timings=$(curl --silent --max-time 25 --output /dev/null \
-                --write-out "connect=%{time_connect}s tls=%{time_appconnect}s" \
-                "https://${host}/") || probe_err=$?
-              if [ "$probe_err" -eq 0 ]; then
-                echo "      • TCP/TLS: ✅ connected (${timings}) — host is reachable; the API call itself stalled."
-              elif [ "$probe_err" -eq 28 ]; then
-                echo "      • TCP/TLS: ❌ connect timed out (curl exit 28) — TCP/443 to ${host} is blocked or dropped (egress firewall)."
-              else
-                echo "      • TCP/TLS: ❌ failed (curl exit ${probe_err}) connecting to ${host}."
-              fi
-            else
-              echo "   ❓ Unexpected (HTTP ${http_code}, curl exit ${curl_err}) from ${org}."
-            fi
-          done
-
-      - name: Inspect SP permissions in msazure/One
-        env:
-          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
-        run: |
-          # Diagnostic only — never fails the job. Runs AS THE SP (the OIDC
-          # identity) so it reports the SP's OWN effective permissions, not a
-          # human's. Answers "what can github-ado-trigger-oidc actually do in
-          # msazure/One?" two ways:
-          #   1. Empirical read probes — which endpoints return 200 vs 404/403.
-          #   2. Permission Evaluation Batch API — the authoritative allow/deny
-          #      list for the calling identity, decoded to permission names.
-          org="https://dev.azure.com/msazure"
-          project="One"
-
-          echo "🔐 Inspecting SP effective permissions in ${org}/${project}"
-
-          # --- Empirical capability probes -------------------------------------
-          probe() {
-            local label="$1" url="$2"
-            local code
-            code=$(curl --silent --max-time 25 -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer ${ADO_TOKEN}" "$url" 2>/dev/null || echo 000)
-            printf '   • %-28s HTTP %s\n' "$label" "$code"
-          }
-          probe "read project"        "${org}/_apis/projects/${project}?api-version=7.1"
-          probe "list teams"          "${org}/_apis/projects/${project}/teams?api-version=7.1"
-          probe "read area paths"     "${org}/_apis/wit/classificationnodes/areas?\$depth=1&api-version=7.1"
-          probe "list work item types" "${org}/_apis/wit/workitemtypes?api-version=7.1&project=${project}"
-
-          # WIQL count — how many work items in the project the SP is allowed to see.
-          wiql_count=$(curl --silent --max-time 25 \
-            -H "Authorization: Bearer ${ADO_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -X POST "${org}/${project}/_apis/wit/wiql?api-version=7.1" \
-            -d '{"query":"SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"}' \
-            2>/dev/null | jq -r '(.workItems // []) | length' 2>/dev/null)
-          echo "   • WIQL visible work items:   ${wiql_count:-error}"
-
-          # --- Authoritative Permission Evaluation Batch -----------------------
-          # Resolve the project id (token for the Project security namespace is
-          # keyed on it).
-          project_id=$(curl --silent --max-time 25 \
-            -H "Authorization: Bearer ${ADO_TOKEN}" \
-            "${org}/_apis/projects/${project}?api-version=7.1" \
-            | jq -r '.id // empty' 2>/dev/null)
-
-          if [ -z "$project_id" ]; then
-            echo "   ⚠️  Could not resolve project id for ${project}; skipping permission evaluation."
-          else
-            echo "   • Project id: ${project_id}"
-
-            # Pull the security namespaces so we can discover the 'Project'
-            # namespace id and its action bit→name map without hardcoding GUIDs.
-            namespaces=$(curl --silent --max-time 25 \
-              -H "Authorization: Bearer ${ADO_TOKEN}" \
-              "${org}/_apis/securitynamespaces?api-version=7.1-preview.1")
-            proj_ns=$(echo "$namespaces" \
-              | jq -r '.value[] | select(.name=="Project") | .namespaceId' 2>/dev/null)
-
-            if [ -z "$proj_ns" ] || [ "$proj_ns" = "null" ]; then
-              echo "   ⚠️  Could not find the 'Project' security namespace; skipping evaluation."
-            else
-              token="\$PROJECT:vstfs:///Classification/TeamProject/${project_id}"
-
-              # Build one evaluation per action bit in the Project namespace.
-              eval_body=$(echo "$namespaces" | jq \
-                --arg ns "$proj_ns" --arg token "$token" \
-                '{evaluations: [ .value[] | select(.namespaceId==$ns) | .actions[]
-                   | {securityNamespaceId:$ns, token:$token, permissions:.bit} ]}')
-
-              result=$(curl --silent --max-time 25 \
-                -H "Authorization: Bearer ${ADO_TOKEN}" \
-                -H "Content-Type: application/json" \
-                -X POST "${org}/_apis/security/permissionevaluationbatch?api-version=7.1-preview.1" \
-                -d "$eval_body")
-
-              # Zip action display names with the boolean results (same order).
-              echo "   • Effective 'Project' permissions for the SP:"
-              names=$(echo "$namespaces" | jq -c \
-                --arg ns "$proj_ns" '[.value[]|select(.namespaceId==$ns)|.actions[].displayName]')
-              vals=$(echo "$result" | jq -c '[.evaluations[].value]' 2>/dev/null)
-              if [ -n "$vals" ] && [ "$vals" != "null" ]; then
-                jq -n --argjson names "$names" --argjson vals "$vals" \
-                  '[range(0; ($names|length)) | "      \(if $vals[.] then "✅" else "⛔" end) \($names[.])"] | .[]' -r
-              else
-                echo "      ⚠️  Permission evaluation returned no data:"
-                echo "$result" | jq -c '{message, typeKey}' 2>/dev/null | sed 's/^/        /'
-              fi
-            fi
-          fi
 
       - name: Verify work item exists in ADO
         id: verify
@@ -325,20 +129,11 @@ jobs:
               continue
             elif [ "$http_code" -eq 404 ]; then
               # ADO returns 404 both for "doesn't exist" and "no permission to the
-              # area/project". The .message alone (TF401232) is deliberately
-              # ambiguous, but the rest of the error body carries the real
-              # exception type, which DOES distinguish the two cases:
-              #   typeKey=WorkItemExistenceException  -> truly absent OR no read perm
-              #   typeKey=...PermissionException / errorCode!=0 -> permission denied
+              # area/project" (TF401232 is deliberately ambiguous). Surface the
+              # message so the two are distinguishable, then keep looking in the
+              # remaining endpoints.
               ado_msg=$(jq -r '.message // empty' /tmp/ado_response.json 2>/dev/null)
-              ado_typekey=$(jq -r '.typeKey // empty' /tmp/ado_response.json 2>/dev/null)
-              ado_typename=$(jq -r '.typeName // empty' /tmp/ado_response.json 2>/dev/null)
-              ado_errcode=$(jq -r '.errorCode // empty' /tmp/ado_response.json 2>/dev/null)
-              ado_eventid=$(jq -r '.eventId // empty' /tmp/ado_response.json 2>/dev/null)
               echo "   Not found in ${endpoint} (HTTP 404)${ado_msg:+ — $ado_msg}"
-              echo "      • typeKey=${ado_typekey:-<none>} typeName=${ado_typename:-<none>} errorCode=${ado_errcode:-<none>} eventId=${ado_eventid:-<none>}"
-              echo "      • Full error body:"
-              jq -c '.' /tmp/ado_response.json 2>/dev/null | sed 's/^/        /' || sed 's/^/        /' /tmp/ado_response.json
               continue
             elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
               echo "⚠️  Could not reach ${endpoint} (curl exit ${curl_err}, no HTTP response). This is a network/egress problem, not an auth failure. Skipping..."
