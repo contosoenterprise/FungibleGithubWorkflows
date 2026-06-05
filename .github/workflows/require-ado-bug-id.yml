@@ -84,6 +84,28 @@ jobs:
 
             if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
               echo "   ✅ REACHABLE + AUTHORIZED (HTTP ${http_code}) — OIDC identity can access ${org}"
+
+              # Ask ADO who it thinks we are. connectionData.authenticatedUser is
+              # the single most useful signal for a TF401232 "exists or no
+              # permission" puzzle: if it shows the expected service principal the
+              # token is honored and the problem is purely work-item/area-path
+              # read permission; if it shows an anonymous/public identity the token
+              # is being silently dropped for this org.
+              if curl --silent --max-time 25 --output /tmp/ado_conn.json \
+                -H "Authorization: Bearer ${ADO_TOKEN}" \
+                "${org}/_apis/connectionData?api-version=7.1"; then
+                auth_name=$(jq -r '.authenticatedUser.providerDisplayName // .authenticatedUser.customDisplayName // "Unknown"' /tmp/ado_conn.json 2>/dev/null)
+                auth_desc=$(jq -r '.authenticatedUser.subjectDescriptor // ""' /tmp/ado_conn.json 2>/dev/null)
+                auth_id=$(jq -r '.authenticatedUser.id // ""' /tmp/ado_conn.json 2>/dev/null)
+                echo "      • Identity ADO sees: ${auth_name}${auth_desc:+ (${auth_desc})}${auth_id:+ [id ${auth_id}]}"
+                case "$auth_desc" in
+                  Microsoft.IdentityModel.Claims.ClaimsIdentity*|"")
+                    echo "      ⚠️  This looks like an anonymous/public identity — the bearer token may not be honored for ${org}." ;;
+                esac
+              else
+                echo "      • Could not read connectionData to confirm the authenticated identity."
+              fi
+              rm -f /tmp/ado_conn.json
             elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
               echo "   ⛔ REACHABLE but UNAUTHORIZED (HTTP ${http_code}) — federated identity is NOT a member of ${org}. Add it in ADO org settings."
             elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
@@ -144,7 +166,7 @@ jobs:
               # the step under `bash -e`; capture the exit code to tell a network
               # failure apart from an HTTP auth/permission response.
               curl_err=0
-              http_code=$(curl --silent --max-time 25 \
+              http_code=$(curl --silent --max-time 10 \
                 --output /tmp/ado_response.json --write-out "%{http_code}" \
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
                 "${org}/_apis/wit/workitems/${BUG_ID}?api-version=7.1") || curl_err=$?
@@ -194,10 +216,20 @@ jobs:
               continue
             elif [ "$http_code" -eq 404 ]; then
               # ADO returns 404 both for "doesn't exist" and "no permission to the
-              # area/project". Surface the response body so the two are distinguishable
-              # (e.g. TF401232 = exists but no read permission).
+              # area/project". The .message alone (TF401232) is deliberately
+              # ambiguous, but the rest of the error body carries the real
+              # exception type, which DOES distinguish the two cases:
+              #   typeKey=WorkItemExistenceException  -> truly absent OR no read perm
+              #   typeKey=...PermissionException / errorCode!=0 -> permission denied
               ado_msg=$(jq -r '.message // empty' /tmp/ado_response.json 2>/dev/null)
+              ado_typekey=$(jq -r '.typeKey // empty' /tmp/ado_response.json 2>/dev/null)
+              ado_typename=$(jq -r '.typeName // empty' /tmp/ado_response.json 2>/dev/null)
+              ado_errcode=$(jq -r '.errorCode // empty' /tmp/ado_response.json 2>/dev/null)
+              ado_eventid=$(jq -r '.eventId // empty' /tmp/ado_response.json 2>/dev/null)
               echo "   Not found in ${endpoint} (HTTP 404)${ado_msg:+ — $ado_msg}"
+              echo "      • typeKey=${ado_typekey:-<none>} typeName=${ado_typename:-<none>} errorCode=${ado_errcode:-<none>} eventId=${ado_eventid:-<none>}"
+              echo "      • Full error body:"
+              jq -c '.' /tmp/ado_response.json 2>/dev/null | sed 's/^/        /' || sed 's/^/        /' /tmp/ado_response.json
               continue
             elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
               echo "⚠️  Could not reach ${endpoint} (curl exit ${curl_err}, no HTTP response). This is a network/egress problem, not an auth failure. Skipping..."
