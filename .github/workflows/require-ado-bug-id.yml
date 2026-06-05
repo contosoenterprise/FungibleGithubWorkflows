@@ -68,6 +68,15 @@ jobs:
           # On an unreachable host it additionally probes DNS + TCP connect so
           # the failure self-classifies as "DNS fail" vs "TCP blocked" vs
           # "connected but no HTTP response".
+
+          # Print the signed-in identity so the SP's home tenant/app shows up next
+          # to each org's resolved identity for an unambiguous side-by-side.
+          echo "🪪 Workflow signed in as:"
+          az account show \
+            --query "{tenantId: tenantId, user: user.name, userType: user.type}" \
+            -o json 2>/dev/null | sed 's/^/   /' \
+            || echo "   (could not read az account show)"
+
           read -ra endpoints <<< "$ADO_ENDPOINTS"
 
           for endpoint in "${endpoints[@]}"; do
@@ -149,6 +158,97 @@ jobs:
               echo "   ❓ Unexpected (HTTP ${http_code}, curl exit ${curl_err}) from ${org}."
             fi
           done
+
+      - name: Inspect SP permissions in msazure/One
+        env:
+          ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
+        run: |
+          # Diagnostic only — never fails the job. Runs AS THE SP (the OIDC
+          # identity) so it reports the SP's OWN effective permissions, not a
+          # human's. Answers "what can github-ado-trigger-oidc actually do in
+          # msazure/One?" two ways:
+          #   1. Empirical read probes — which endpoints return 200 vs 404/403.
+          #   2. Permission Evaluation Batch API — the authoritative allow/deny
+          #      list for the calling identity, decoded to permission names.
+          org="https://dev.azure.com/msazure"
+          project="One"
+
+          echo "🔐 Inspecting SP effective permissions in ${org}/${project}"
+
+          # --- Empirical capability probes -------------------------------------
+          probe() {
+            local label="$1" url="$2"
+            local code
+            code=$(curl --silent --max-time 25 -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${ADO_TOKEN}" "$url" 2>/dev/null || echo 000)
+            printf '   • %-28s HTTP %s\n' "$label" "$code"
+          }
+          probe "read project"        "${org}/_apis/projects/${project}?api-version=7.1"
+          probe "list teams"          "${org}/_apis/projects/${project}/teams?api-version=7.1"
+          probe "read area paths"     "${org}/_apis/wit/classificationnodes/areas?\$depth=1&api-version=7.1"
+          probe "list work item types" "${org}/_apis/wit/workitemtypes?api-version=7.1&project=${project}"
+
+          # WIQL count — how many work items in the project the SP is allowed to see.
+          wiql_count=$(curl --silent --max-time 25 \
+            -H "Authorization: Bearer ${ADO_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -X POST "${org}/${project}/_apis/wit/wiql?api-version=7.1" \
+            -d '{"query":"SELECT [System.Id] FROM workitems WHERE [System.TeamProject] = @project"}' \
+            2>/dev/null | jq -r '(.workItems // []) | length' 2>/dev/null)
+          echo "   • WIQL visible work items:   ${wiql_count:-error}"
+
+          # --- Authoritative Permission Evaluation Batch -----------------------
+          # Resolve the project id (token for the Project security namespace is
+          # keyed on it).
+          project_id=$(curl --silent --max-time 25 \
+            -H "Authorization: Bearer ${ADO_TOKEN}" \
+            "${org}/_apis/projects/${project}?api-version=7.1" \
+            | jq -r '.id // empty' 2>/dev/null)
+
+          if [ -z "$project_id" ]; then
+            echo "   ⚠️  Could not resolve project id for ${project}; skipping permission evaluation."
+          else
+            echo "   • Project id: ${project_id}"
+
+            # Pull the security namespaces so we can discover the 'Project'
+            # namespace id and its action bit→name map without hardcoding GUIDs.
+            namespaces=$(curl --silent --max-time 25 \
+              -H "Authorization: Bearer ${ADO_TOKEN}" \
+              "${org}/_apis/securitynamespaces?api-version=7.1-preview.1")
+            proj_ns=$(echo "$namespaces" \
+              | jq -r '.value[] | select(.name=="Project") | .namespaceId' 2>/dev/null)
+
+            if [ -z "$proj_ns" ] || [ "$proj_ns" = "null" ]; then
+              echo "   ⚠️  Could not find the 'Project' security namespace; skipping evaluation."
+            else
+              token="\$PROJECT:vstfs:///Classification/TeamProject/${project_id}"
+
+              # Build one evaluation per action bit in the Project namespace.
+              eval_body=$(echo "$namespaces" | jq \
+                --arg ns "$proj_ns" --arg token "$token" \
+                '{evaluations: [ .value[] | select(.namespaceId==$ns) | .actions[]
+                   | {securityNamespaceId:$ns, token:$token, permissions:.bit} ]}')
+
+              result=$(curl --silent --max-time 25 \
+                -H "Authorization: Bearer ${ADO_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -X POST "${org}/_apis/security/permissionevaluationbatch?api-version=7.1-preview.1" \
+                -d "$eval_body")
+
+              # Zip action display names with the boolean results (same order).
+              echo "   • Effective 'Project' permissions for the SP:"
+              names=$(echo "$namespaces" | jq -c \
+                --arg ns "$proj_ns" '[.value[]|select(.namespaceId==$ns)|.actions[].displayName]')
+              vals=$(echo "$result" | jq -c '[.evaluations[].value]' 2>/dev/null)
+              if [ -n "$vals" ] && [ "$vals" != "null" ]; then
+                jq -n --argjson names "$names" --argjson vals "$vals" \
+                  '[range(0; ($names|length)) | "      \(if $vals[.] then "✅" else "⛔" end) \($names[.])"] | .[]' -r
+              else
+                echo "      ⚠️  Permission evaluation returned no data:"
+                echo "$result" | jq -c '{message, typeKey}' 2>/dev/null | sed 's/^/        /'
+              fi
+            fi
+          fi
 
       - name: Verify work item exists in ADO
         id: verify
