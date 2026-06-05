@@ -60,6 +60,19 @@ jobs:
           ADO_TOKEN: ${{ steps.get-token.outputs.ado_token }}
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
+          # Every PR must carry an ADO bug ID. If the dispatch arrived without
+          # one, fail the check outright and let the report step paste a message.
+          if [ -z "${BUG_ID//[[:space:]]/}" ]; then
+            echo "::error::No ADO bug ID found — every PR must reference an ADO work item."
+            {
+              echo "status=failure"
+              echo "description=No ADO bug ID found in the PR"
+              echo "ado_url="
+              echo "missing=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
           # ADO_ENDPOINTS is defined at job level — add new orgs there
           read -ra endpoints <<< "$ADO_ENDPOINTS"
 
@@ -145,13 +158,14 @@ jobs:
           done
 
           if [ "$found" = false ]; then
-            echo "⚠️ ADO work item ${BUG_ID} not found in any accessible ADO project."
+            echo "::error::ADO work item ${BUG_ID} not found in any accessible ADO project."
             {
-              echo "status=success"
+              echo "status=failure"
               echo "description=Work item ${BUG_ID} not found in accessible projects"
               echo "ado_url="
-              echo "unverified=true"
             } >> "$GITHUB_OUTPUT"
+            rm -f /tmp/ado_response.json
+            exit 1
           fi
 
           rm -f /tmp/ado_response.json
@@ -168,8 +182,8 @@ jobs:
           BUG_ID: ${{ steps.info.outputs.bug_id }}
         run: |
           ADO_URL="${{ steps.verify.outputs.ado_url }}"
-          UNVERIFIED="${{ steps.verify.outputs.unverified }}"
           INVALID="${{ steps.verify.outputs.invalid }}"
+          MISSING="${{ steps.verify.outputs.missing }}"
           MARKER="<!-- ado-bug-id-check -->"
 
           # Set commit status
@@ -190,18 +204,20 @@ jobs:
             --data "$status_data"
 
           # Build comment body
-          if [ "$STATUS" = "success" ] && [ "$INVALID" = "true" ]; then
+          if [ "$MISSING" = "true" ]; then
+            BODY="${MARKER}
+          ## ❌ Missing ADO Bug ID
+
+          This PR does not reference an ADO work item. Every PR must include a
+          valid ADO bug ID in its title.
+
+          Please add the bug ID to your PR title and push again."
+          elif [ "$STATUS" = "success" ] && [ "$INVALID" = "true" ]; then
             BODY="${MARKER}
           ## ⚠️ ADO Bug ID: **${BUG_ID}**
 
           Work item ID **${BUG_ID}** does not appear to be a valid ADO work item ID.
           Please double-check the ID in your PR title."
-          elif [ "$STATUS" = "success" ] && [ "$UNVERIFIED" = "true" ]; then
-            BODY="${MARKER}
-          ## ⚠️ ADO Bug ID: **${BUG_ID}**
-
-          Work item **${BUG_ID}** was not found in any ADO project the bot has access to.
-          It may exist in another project — please verify the ID is correct."
           elif [ "$STATUS" = "success" ]; then
             BODY="${MARKER}
           ## ✅ ADO Bug ID Verified: [${BUG_ID}](${ADO_URL})
@@ -225,7 +241,9 @@ jobs:
           Please check that the work item ID in your PR title is correct."
           fi
 
-          # Update existing PR comment (left by check-title job)
+          # Update the existing PR comment if one is present (left by an earlier
+          # run or the check-title job); otherwise create it so the message is
+          # always posted.
           COMMENTS_URL="https://api.github.com/repos/${SOURCE_REPO}/issues/${PR_NUMBER}/comments"
           EXISTING=$(curl -s \
             -H "Accept: application/vnd.github.v3+json" \
@@ -238,6 +256,12 @@ jobs:
               -H "Accept: application/vnd.github.v3+json" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/${SOURCE_REPO}/issues/comments/${EXISTING}" \
+              -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+          else
+            curl -s -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${COMMENTS_URL}" \
               -d "$(jq -n --arg body "$BODY" '{body: $body}')"
           fi
 
