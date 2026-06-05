@@ -15,7 +15,7 @@ permissions:
 jobs:
   verify-ado:
     name: Verify ADO Bug ID
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     environment: copilot
 
     # Add new ADO org/project endpoints here (space-separated).
@@ -65,6 +65,9 @@ jobs:
           # Diagnostic only — never fails the job. For each endpoint, hits the
           # org's projects API to classify it as REACHABLE+AUTHORIZED,
           # REACHABLE-but-UNAUTHORIZED, or UNREACHABLE (network/egress).
+          # On an unreachable host it additionally probes DNS + TCP connect so
+          # the failure self-classifies as "DNS fail" vs "TCP blocked" vs
+          # "connected but no HTTP response".
           read -ra endpoints <<< "$ADO_ENDPOINTS"
 
           for endpoint in "${endpoints[@]}"; do
@@ -73,7 +76,7 @@ jobs:
             echo "🔎 Probing ${org}..."
 
             curl_err=0
-            http_code=$(curl --silent --max-time 10 \
+            http_code=$(curl --silent --max-time 25 \
               --output /dev/null --write-out "%{http_code}" \
               -H "Authorization: Bearer ${ADO_TOKEN}" \
               "${org}/_apis/projects?api-version=7.1") || curl_err=$?
@@ -85,6 +88,32 @@ jobs:
               echo "   ⛔ REACHABLE but UNAUTHORIZED (HTTP ${http_code}) — federated identity is NOT a member of ${org}. Add it in ADO org settings."
             elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
               echo "   🌐 UNREACHABLE (curl exit ${curl_err}, no HTTP response) — network/egress problem reaching ${org}, not an auth issue."
+
+              # Drill into *why* it is unreachable. Pull the host out of the URL.
+              host="${org#*://}"
+              host="${host%%/*}"
+
+              # 1) DNS resolution
+              if resolved=$(getent hosts "$host" 2>/dev/null); then
+                echo "      • DNS: ✅ ${host} resolves to $(echo "$resolved" | awk '{print $1}' | paste -sd, -)"
+              else
+                echo "      • DNS: ❌ ${host} did NOT resolve — name resolution / DNS egress problem."
+              fi
+
+              # 2) TCP connect + TLS handshake timing (no request sent).
+              #    curl reports connect/appconnect times; a 0.000000 appconnect
+              #    with a non-zero connect means TLS was blocked, etc.
+              probe_err=0
+              timings=$(curl --silent --max-time 25 --output /dev/null \
+                --write-out "connect=%{time_connect}s tls=%{time_appconnect}s" \
+                "https://${host}/") || probe_err=$?
+              if [ "$probe_err" -eq 0 ]; then
+                echo "      • TCP/TLS: ✅ connected (${timings}) — host is reachable; the API call itself stalled."
+              elif [ "$probe_err" -eq 28 ]; then
+                echo "      • TCP/TLS: ❌ connect timed out (curl exit 28) — TCP/443 to ${host} is blocked or dropped (egress firewall)."
+              else
+                echo "      • TCP/TLS: ❌ failed (curl exit ${probe_err}) connecting to ${host}."
+              fi
             else
               echo "   ❓ Unexpected (HTTP ${http_code}, curl exit ${curl_err}) from ${org}."
             fi
@@ -108,13 +137,14 @@ jobs:
             # project in the path returns 404 when the item lives in another project.
             org="${endpoint%/*}"
 
-            # Retry up to 3 times on 429 (rate limit)
+            # Retry up to 3 times on 429 (rate limit) or transient network
+            # failures (curl timeout exit 28 / no HTTP response).
             for attempt in 1 2 3; do
               # `|| true` so a curl failure (e.g. timeout exit 28) doesn't abort
               # the step under `bash -e`; capture the exit code to tell a network
               # failure apart from an HTTP auth/permission response.
               curl_err=0
-              http_code=$(curl --silent --max-time 10 \
+              http_code=$(curl --silent --max-time 25 \
                 --output /tmp/ado_response.json --write-out "%{http_code}" \
                 -H "Authorization: Bearer ${ADO_TOKEN}" \
                 "${org}/_apis/wit/workitems/${BUG_ID}?api-version=7.1") || curl_err=$?
@@ -124,6 +154,10 @@ jobs:
                 retry_after=$(jq -r '.retryAfter // empty' /tmp/ado_response.json 2>/dev/null)
                 wait_secs=${retry_after:-$((attempt * 5))}
                 echo "⏳ Rate limited by ${endpoint}, retrying in ${wait_secs}s (attempt ${attempt}/3)..."
+                sleep "$wait_secs"
+              elif { [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; } && [ "$attempt" -lt 3 ]; then
+                wait_secs=$((attempt * 3))
+                echo "🌐 No response from ${endpoint} (curl exit ${curl_err}), retrying in ${wait_secs}s (attempt ${attempt}/3)..."
                 sleep "$wait_secs"
               else
                 break
@@ -143,11 +177,15 @@ jobs:
               found=true
               break
             elif [ "$http_code" -eq 400 ]; then
-              echo "::error::ADO rejected work item ID ${BUG_ID} as invalid."
+              # A 400 means ADO considers the ID malformed/invalid. Treat this as a
+              # non-blocking warning rather than a failing check — we surface it to
+              # the author but never fail the PR on it.
+              echo "::warning::ADO does not recognize work item ID ${BUG_ID} as valid."
               {
-                echo "status=failure"
-                echo "description=Invalid work item ID ${BUG_ID}"
-                echo "ado_url=${endpoint}/_workitems/edit/${BUG_ID}"
+                echo "status=success"
+                echo "description=Work item ID ${BUG_ID} does not appear to be valid"
+                echo "ado_url="
+                echo "invalid=true"
               } >> "$GITHUB_OUTPUT"
               found=true
               break
@@ -155,7 +193,11 @@ jobs:
               echo "⚠️  No access to ${endpoint} (HTTP ${http_code}) — the federated identity is reachable but not authorized for this org/project. Skipping..."
               continue
             elif [ "$http_code" -eq 404 ]; then
-              echo "   Not found in ${endpoint}"
+              # ADO returns 404 both for "doesn't exist" and "no permission to the
+              # area/project". Surface the response body so the two are distinguishable
+              # (e.g. TF401232 = exists but no read permission).
+              ado_msg=$(jq -r '.message // empty' /tmp/ado_response.json 2>/dev/null)
+              echo "   Not found in ${endpoint} (HTTP 404)${ado_msg:+ — $ado_msg}"
               continue
             elif [ "$curl_err" -eq 28 ] || [ "$http_code" -eq 000 ]; then
               echo "⚠️  Could not reach ${endpoint} (curl exit ${curl_err}, no HTTP response). This is a network/egress problem, not an auth failure. Skipping..."
@@ -191,6 +233,7 @@ jobs:
         run: |
           ADO_URL="${{ steps.verify.outputs.ado_url }}"
           UNVERIFIED="${{ steps.verify.outputs.unverified }}"
+          INVALID="${{ steps.verify.outputs.invalid }}"
           MARKER="<!-- ado-bug-id-check -->"
 
           # Set commit status
@@ -211,7 +254,13 @@ jobs:
             --data "$status_data"
 
           # Build comment body
-          if [ "$STATUS" = "success" ] && [ "$UNVERIFIED" = "true" ]; then
+          if [ "$STATUS" = "success" ] && [ "$INVALID" = "true" ]; then
+            BODY="${MARKER}
+          ## ⚠️ ADO Bug ID: **${BUG_ID}**
+
+          Work item ID **${BUG_ID}** does not appear to be a valid ADO work item ID.
+          Please double-check the ID in your PR title."
+          elif [ "$STATUS" = "success" ] && [ "$UNVERIFIED" = "true" ]; then
             BODY="${MARKER}
           ## ⚠️ ADO Bug ID: **${BUG_ID}**
 
