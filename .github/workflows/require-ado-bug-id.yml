@@ -22,7 +22,6 @@ jobs:
     env:
       ADO_ENDPOINTS: >-
         https://dev.azure.com/AzureCSI/Fungible
-        https://dev.azure.com/AzureCSI/Dev
         https://dev.azure.com/msazure/One
 
     steps:
