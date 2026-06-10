@@ -1,15 +1,12 @@
-# TESTING variant of require-ado-bug-id.yml.
-# Identical to the production receiver except it listens for the
-# `verify-ado-bug-id-testing` repository_dispatch event sent by the matching
-# require-ado-bug-id-testing.yml in GithubWorkflows. This lets changes be
-# validated end-to-end (real OIDC + ADO lookup, real PR reporting) without
-# touching the production `verify-ado-bug-id` path.
+# Verify ADO Bug ID exists via OIDC
+# Receives dispatch from fungible-inc/GitHubWorkflows, authenticates via OIDC,
+# checks the work item exists in ADO, and reports back to the source PR
 
-name: Verify ADO Bug ID (Testing)
+name: Verify ADO Bug ID
 
 on:
   repository_dispatch:
-    types: [verify-ado-bug-id-testing]
+    types: [verify-ado-bug-id]
 
 permissions:
   id-token: write
